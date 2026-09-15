@@ -1,0 +1,7 @@
+venv
+env
+.env
+.env.docker
+__pycache__
+logs/*
+data/
