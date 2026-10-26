@@ -1,62 +1,93 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
+import asyncio
+from contextlib import asynccontextmanager
 
-# Komponen LangChain
-from langchain_community.llms import Ollama
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_chroma import Chroma
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from dataset_management.db import SessionLocal, get_optional_session
+from dataset_management.models import Configuration
+from dataset_management.rag import build_rag_prompt, create_chat_model, create_vector_store, format_docs
+from dataset_management.routes import router as dataset_router
+from dataset_management.runtime_config import load_configuration
+from dataset_management.runtime_routes import router as runtime_router
+from dataset_management.service import cleanup_loop
+from dataset_management.settings import get_settings
+
+CHAT_COMPLETIONS_PATH = "/api/v1/chat/completions"
+MAX_CHAT_REQUEST_BODY_BYTES = 1_048_576
+
+
+class ChatRequestBodyLimitMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or scope["method"] != "POST"
+            or scope["path"] != CHAT_COMPLETIONS_PATH
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        response = JSONResponse(
+            status_code=413,
+            content={"detail": "Chat request body is too large"},
+        )
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            if message["type"] != "http.request":
+                continue
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) > MAX_CHAT_REQUEST_BODY_BYTES:
+                await response(scope, receive, send)
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        request_body = bytes(body)
+        delivered = False
+
+        async def replay_receive():
+            nonlocal delivered
+            if delivered:
+                return await receive()
+            delivered = True
+            return {"type": "http.request", "body": request_body, "more_body": False}
+
+        await self.app(scope, replay_receive, send)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        settings = get_settings()
+    except ValidationError:
+        yield
+        return
+    cleanup_task = asyncio.create_task(cleanup_loop(SessionLocal, settings))
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        await asyncio.gather(cleanup_task, return_exceptions=True)
 
 app = FastAPI(
     title="Aurota RAG API", 
-    description="Microservice API untuk RAG repositori kode"
+    description="Microservice API untuk RAG repositori kode",
+    lifespan=lifespan,
 )
+app.add_middleware(ChatRequestBodyLimitMiddleware)
+app.include_router(dataset_router)
+app.include_router(runtime_router)
 
-# ---------------------------------------------------------
-# Konfigurasi AI & Vector DB
-# ---------------------------------------------------------
-# Gunakan model embedding khusus kode/teks dari Ollama (misal: nomic-embed-text)
-embeddings = OllamaEmbeddings(model="nomic-embed-text")
-
-# Inisialisasi LLM lokal (misal: llama3)
-llm = Ollama(model="llama3")
-
-# Inisialisasi ChromaDB (akan tersimpan secara lokal di folder ./chroma_data)
-vector_store = Chroma(
-    collection_name="source_code",
-    embedding_function=embeddings,
-    persist_directory="./data/chroma_data"
-)
-
-# Buat retriever untuk mengambil 4 potongan kode paling relevan
-retriever = vector_store.as_retriever(search_kwargs={"k": 4})
-
-# Template prompt agar LLM fokus menjawab berdasarkan konteks kode
-template = """Anda adalah asisten AI khusus untuk developer.
-Gunakan potongan kode berikut untuk menjawab pertanyaan. Jika jawabannya tidak ada di kode, katakan tidak tahu.
-
-Konteks Kode (dan Path File):
-{context}
-
-Pertanyaan: {question}
-
-Jawaban (Gunakan Markdown untuk format kode jika diperlukan):"""
-prompt = PromptTemplate.from_template(template)
-
-# RAG Chain menggunakan LCEL (LangChain Expression Language)
-def format_docs(docs):
-    # Menggabungkan konten kode beserta metadata path file
-    return "\n\n".join(f"File: {doc.metadata.get('source', 'Unknown')}\n{doc.page_content}" for doc in docs)
-
-rag_chain = (
-    {"context": retriever | format_docs, "question": RunnablePassthrough()}
-    | prompt
-    | llm
-    | StrOutputParser()
-)
 
 # ---------------------------------------------------------
 # Pydantic Schemas
@@ -76,22 +107,53 @@ class QueryResponse(BaseModel):
 # Endpoints
 # ---------------------------------------------------------
 @app.post("/ingest", summary="Simpan potongan kode ke Vector DB")
-async def ingest_code(req: IngestRequest):
+async def ingest_code(
+    req: IngestRequest,
+    session: AsyncSession | None = Depends(get_optional_session),
+):
     try:
-        # Menyimpan kode ke Chroma beserta metadata-nya
-        vector_store.add_texts(
-            texts=[req.code_content],
-            metadatas=[{"source": req.file_path, "language": req.language}]
-        )
+        if session is None:
+            configuration = await load_configuration(None)
+            vector_store = create_vector_store(configuration["embedding.model"])
+            await asyncio.to_thread(
+                vector_store.add_texts,
+                texts=[req.code_content],
+                metadatas=[{"source": req.file_path, "language": req.language}],
+            )
+        else:
+            async with session.begin():
+                await session.scalar(
+                    select(Configuration)
+                    .where(Configuration.key == "embedding.model")
+                    .with_for_update()
+                )
+                configuration = await load_configuration(session)
+                vector_store = create_vector_store(configuration["embedding.model"])
+                await asyncio.to_thread(
+                    vector_store.add_texts,
+                    texts=[req.code_content],
+                    metadatas=[{"source": req.file_path, "language": req.language}],
+                )
         return {"status": "success", "message": f"Berhasil menyimpan {req.file_path}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
 
 @app.post("/query", response_model=QueryResponse, summary="Tanya kode menggunakan RAG")
-async def query_code(req: QueryRequest):
+async def query_code(
+    req: QueryRequest,
+    session: AsyncSession | None = Depends(get_optional_session),
+):
     try:
-        # Menjalankan chain: Embed pertanyaan -> Cari di Chroma -> Kirim ke LLM -> Kembalikan teks
-        response_text = rag_chain.invoke(req.question)
-        return QueryResponse(answer=response_text)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        configuration = await load_configuration(session)
+        vector_store = create_vector_store(configuration["embedding.model"])
+        documents = await asyncio.to_thread(
+            vector_store.similarity_search,
+            req.question,
+            k=int(configuration["retrieval.k"]),
+        )
+        prompt = build_rag_prompt(configuration, format_docs(documents), req.question)
+        response_text = await create_chat_model(configuration["chat.model"]).ainvoke(prompt)
+        return QueryResponse(answer=str(response_text))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
