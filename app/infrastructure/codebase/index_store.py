@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -301,14 +302,67 @@ class CodebaseIndexStore:
     def _metadata_path(self, project_id: str) -> Path:
         return self._project_dir(project_id) / "current"
 
-    def _cleanup_project_collections(self, project_id: str, *, keep: str | None = None) -> None:
+    def _generation_path(self, project_id: str, generation: str) -> Path:
+        return self._project_dir(project_id) / f"generation-{generation}.json"
+
+    def _building_generation_path(self, project_id: str, generation: str) -> Path:
+        return self._project_dir(project_id) / f"generation-{generation}.building"
+
+    def _publication_lock_path(self, project_id: str) -> Path:
+        return self.root / f".{project_id}.publication.lock"
+
+    def _generation_lock_path(self, project_id: str, generation: str) -> Path:
+        return self.root / f".{project_id}.{generation}.readers.lock"
+
+    @staticmethod
+    def _open_flock(path: Path) -> int:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return os.open(str(path), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+
+    @staticmethod
+    def _release_flock(fd: int) -> None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _cleanup_project_collections(self, project_id: str, *, keep: str | None = None,
+                                     include_unpublished: bool = False) -> bool:
         client = self._client()
+        candidates = []
         for item in client.list_collections():
             name = item if isinstance(item, str) else item.name
             collection = item if not isinstance(item, str) else client.get_collection(name)
             metadata = collection.metadata or {}
-            if metadata.get("project_id") == project_id and name != keep:
+            if metadata.get("project_id") != project_id or name == keep:
+                continue
+            generation = metadata.get("generation")
+            if not include_unpublished and (not generation or not self._generation_path(project_id, generation).exists()):
+                continue
+            candidates.append((name, generation))
+        locks = []
+        try:
+            for _, generation in candidates:
+                if not generation:
+                    continue
+                reader_fd = self._open_flock(self._generation_lock_path(project_id, generation))
+                try:
+                    fcntl.flock(reader_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    self._release_flock(reader_fd)
+                    return False
+                locks.append((reader_fd, generation))
+            for name, generation in candidates:
                 client.delete_collection(name)
+                if generation:
+                    try:
+                        self._generation_path(project_id, generation).unlink()
+                    except FileNotFoundError:
+                        pass
+            return True
+        finally:
+            for reader_fd, _ in locks:
+                self._release_flock(reader_fd)
 
     def _published(self, project_id: str) -> dict[str, Any] | None:
         try:
@@ -322,6 +376,8 @@ class CodebaseIndexStore:
         lock = None
         model_lock = None
         collection_name = None
+        generation = None
+        published = False
         try:
             if not model_lock_held:
                 model_lock = self.acquire_model_lock()
@@ -351,20 +407,38 @@ class CodebaseIndexStore:
             directory.mkdir(parents=True, exist_ok=True)
             metadata = {"project_id": project_id, "generation": generation,
                         "collection_name": collection_name, "embedding_model": model}
+            generation_temp = self._building_generation_path(project_id, generation)
+            generation_temp.write_text(json.dumps(metadata), encoding="utf-8")
             temporary = directory / f".current-{generation}.tmp"
             temporary.write_text(json.dumps(metadata), encoding="utf-8")
-            os.replace(temporary, self._metadata_path(project_id))
+            publication_fd = self._open_flock(self._publication_lock_path(project_id))
             try:
-                self._cleanup_project_collections(project_id, keep=collection_name)
-            except Exception:
-                pass
+                fcntl.flock(publication_fd, fcntl.LOCK_EX)
+                os.replace(temporary, self._metadata_path(project_id))
+                published = True
+                os.replace(generation_temp, self._generation_path(project_id, generation))
+                try:
+                    self._cleanup_project_collections(project_id, keep=collection_name)
+                except Exception:
+                    pass
+            finally:
+                self._release_flock(publication_fd)
             return {"project_id": project_id, "indexed_chunks": len(chunks),
                     "skipped_files": len(skipped), "skipped_paths": skipped}
         except Exception:
-            if collection_name is not None:
+            if collection_name is not None and not published:
                 try:
                     self._client().delete_collection(collection_name)
                 except Exception:
+                    pass
+            if collection_name is not None and generation is not None and not published:
+                try:
+                    self._building_generation_path(project_id, generation).unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    self._generation_path(project_id, generation).unlink()
+                except FileNotFoundError:
                     pass
             raise
         finally:
@@ -376,11 +450,17 @@ class CodebaseIndexStore:
     def delete(self, project_id: str) -> None:
         self.validate_project_id(project_id)
         lock = self._acquire(project_id)
+        publication_fd = None
         try:
-            self._cleanup_project_collections(project_id)
+            publication_fd = self._open_flock(self._publication_lock_path(project_id))
+            fcntl.flock(publication_fd, fcntl.LOCK_EX)
+            if not self._cleanup_project_collections(project_id, include_unpublished=True):
+                raise ProjectBusy("project has active readers")
             import shutil
             shutil.rmtree(self._project_dir(project_id), ignore_errors=True)
         finally:
+            if publication_fd is not None:
+                self._release_flock(publication_fd)
             lock.release()
 
     def projects(self) -> list[str]:
@@ -401,15 +481,19 @@ class CodebaseIndexStore:
                     for document, score in legacy.similarity_search_with_relevance_scores(query, k=limit)]
         self.validate_project_id(project_id)
         self.root.mkdir(parents=True, exist_ok=True)
-        lock = FileLock(str(self.root / f".{project_id}.lock"), thread_local=False)
+        publication_fd = self._open_flock(self._publication_lock_path(project_id))
+        reader_fd = None
         try:
-            try:
-                lock.acquire(timeout=30)
-            except Timeout as exc:
-                raise ProjectBusy("project operation already in progress") from exc
+            fcntl.flock(publication_fd, fcntl.LOCK_SH)
             payload = self._published(project_id)
             if not payload:
                 return []
+            reader_fd = self._open_flock(
+                self._generation_lock_path(project_id, payload["generation"])
+            )
+            fcntl.flock(reader_fd, fcntl.LOCK_SH)
+            self._release_flock(publication_fd)
+            publication_fd = None
             vector = OllamaEmbeddings(model=payload["embedding_model"]).embed_query(query)
             result = self._client().get_collection(payload["collection_name"]).query(
                 query_embeddings=[vector], n_results=limit, include=["documents", "metadatas", "distances"]
@@ -422,8 +506,17 @@ class CodebaseIndexStore:
                      "score": float(1 - distance)}
                     for content, metadata, distance in zip(documents, metadatas, distances)]
         finally:
-            if lock.is_locked:
-                lock.release()
+            if publication_fd is not None:
+                self._release_flock(publication_fd)
+            if reader_fd is not None:
+                self._release_flock(reader_fd)
+            try:
+                current = self._published(project_id)
+                self._cleanup_project_collections(
+                    project_id, keep=current.get("collection_name") if current else None
+                )
+            except Exception:
+                pass
 
     def has_published_chunks(self) -> bool:
         client = self._client()

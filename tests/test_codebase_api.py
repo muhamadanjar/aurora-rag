@@ -155,6 +155,47 @@ async def test_same_project_http_indexes_conflict_without_blocking_event_loop(co
     assert second.status_code == 409
 
 
+@pytest.mark.asyncio
+async def test_search_reads_old_generation_during_paused_reindex_then_new_generation(codebase_client, codebase_env, monkeypatch):
+    root = codebase_env / "roots" / "snapshot"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("old generation", encoding="utf-8")
+    headers = {"Authorization": "Bearer codebase-test-token"}
+    initial = await codebase_client.post("/codebase/projects/snapshot/index", headers=headers,
+                                         json={"path": str(root)})
+    assert initial.status_code == 200
+
+    source.write_text("new generation", encoding="utf-8")
+    started = threading.Event()
+    release = threading.Event()
+    original = index_store.OllamaEmbeddings.embed_documents
+
+    def pause_first_embedding(self, texts):
+        if not started.is_set():
+            started.set()
+            release.wait(timeout=2)
+        return original(self, texts)
+
+    monkeypatch.setattr(index_store.OllamaEmbeddings, "embed_documents", pause_first_embedding)
+    reindex = asyncio.create_task(codebase_client.post("/codebase/projects/snapshot/index", headers=headers,
+                                                       json={"path": str(root)}))
+    assert await asyncio.to_thread(started.wait, 1)
+
+    old_search = await codebase_client.post("/codebase/search", headers=headers,
+                                            json={"project_id": "snapshot", "query": "old generation", "limit": 5})
+    assert old_search.status_code == 200
+    assert any("old generation" in item["content"] for item in old_search.json()["results"])
+
+    release.set()
+    published = await reindex
+    assert published.status_code == 200
+    new_search = await codebase_client.post("/codebase/search", headers=headers,
+                                            json={"project_id": "snapshot", "query": "new generation", "limit": 5})
+    assert new_search.status_code == 200
+    assert any("new generation" in item["content"] for item in new_search.json()["results"])
+
+
 def test_same_project_operations_are_rejected_across_workers(codebase_env):
     store = CodebaseIndexStore()
     lock = store._acquire("demo")
@@ -238,16 +279,6 @@ async def test_directory_only_ignore_skips_unreadable_special_children(codebase_
     assert response.status_code == 200
     assert response.json()["indexed_chunks"] == 1
 
-
-def test_search_timeout_becomes_project_busy(monkeypatch, codebase_env):
-    from filelock import Timeout
-
-    def timeout(_self, timeout):
-        raise Timeout("project.lock")
-
-    monkeypatch.setattr(index_store.FileLock, "acquire", timeout)
-    with pytest.raises(ProjectBusy):
-        CodebaseIndexStore().search("demo", "query", 1)
 
 
 @pytest.mark.asyncio
