@@ -37,7 +37,7 @@ class RuntimeConfigService:
         if key == "embedding.model" and current_value != normalized:
             if await asyncio.to_thread(self._vector_count) > 0:
                 raise ResourceConflict(
-                    "embedding.model cannot change after Chroma contains vectors"
+                    "embedding.model cannot change after indexed data exists"
                 )
 
         if current is None:

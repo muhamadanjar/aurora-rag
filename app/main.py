@@ -21,6 +21,7 @@ from app.core.exceptions import (
 )
 from app.delivery.middleware import ChatRequestBodyLimitMiddleware
 from app.delivery.routers.auth_router import router as auth_router
+from app.delivery.routers.codebase_router import router as codebase_router
 from app.delivery.routers.dataset_router import router as dataset_router
 from app.delivery.routers.rag_router import router as rag_router
 from app.delivery.routers.runtime_router import router as runtime_router
@@ -52,6 +53,7 @@ app.include_router(auth_router)
 app.include_router(dataset_router)
 app.include_router(runtime_router)
 app.include_router(rag_router)
+app.include_router(codebase_router)
 
 
 _STATUS_BY_EXCEPTION = {

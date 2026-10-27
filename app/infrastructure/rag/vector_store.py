@@ -30,3 +30,10 @@ def indexed_vector_count() -> int:
     client = PersistentClient(path=CHROMA_DIRECTORY)
     collection = client.get_or_create_collection(name=CHROMA_COLLECTION)
     return collection.count()
+
+
+def indexed_codebase_count() -> int:
+    """Return the number of published codebase chunks without opening Chroma."""
+    from app.infrastructure.codebase.index_store import published_chunk_count
+
+    return published_chunk_count()

@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     export_root: Path = Path("./data/exports")
     export_retention_days: int = 30
     cleanup_interval_seconds: int = 3600
+    aurora_codebase_token: str | None = None
+    aurora_codebase_roots: str = ""
+    aurora_codebase_index_root: Path = Path("./data/codebase_index")
 
     @field_validator("jwt_secret")
     @classmethod

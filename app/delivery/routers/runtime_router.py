@@ -13,6 +13,7 @@ from app.domain.unit_of_work import UnitOfWork
 from app.infrastructure.rag.vector_store import (
     create_chat_model,
     create_vector_store,
+    indexed_codebase_count,
     indexed_vector_count,
 )
 
@@ -29,7 +30,7 @@ async def list_configuration(
     actor=Depends(current_operator),
 ):
     entries = await RuntimeConfigService(
-        uow, vector_count=indexed_vector_count
+        uow, vector_count=lambda: max(indexed_vector_count(), indexed_codebase_count())
     ).list()
     return {"data": entries}
 
@@ -42,7 +43,7 @@ async def update_configuration(
     actor=Depends(current_operator),
 ):
     entry = await RuntimeConfigService(
-        uow, vector_count=indexed_vector_count
+        uow, vector_count=lambda: max(indexed_vector_count(), indexed_codebase_count())
     ).update(key, body.value)
     return {"id": str(entry.id), "key": entry.key, "value": entry.value}
 
