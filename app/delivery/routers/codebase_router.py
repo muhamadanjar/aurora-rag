@@ -29,8 +29,8 @@ def require_codebase_token(credentials: HTTPAuthorizationCredentials | None = De
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
 
 
-def _service() -> CodebaseService:
-    return CodebaseService()
+def _service(store: CodebaseIndexStore | None = None) -> CodebaseService:
+    return CodebaseService(store)
 
 
 @router.post("/projects/{project_id}/index")

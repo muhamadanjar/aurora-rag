@@ -167,7 +167,20 @@ async def test_path_confinement_and_project_listing(codebase_client, codebase_en
     assert (await codebase_client.delete("/codebase/projects/legacy", headers=headers)).status_code == 422
     outside = codebase_env / "outside"
     outside.mkdir()
+    (codebase_env / "roots" / "escape").symlink_to(outside, target_is_directory=True)
+    symlinked = await codebase_client.post("/codebase/projects/demo/index", headers=headers,
+                                           json={"path": str(codebase_env / "roots" / "escape")})
+    assert symlinked.status_code == 422
     rejected = await codebase_client.post("/codebase/projects/../bad/index", headers=headers, json={"path": str(outside)})
     assert rejected.status_code in {404, 422}
     projects = await codebase_client.get("/codebase/projects", headers=headers)
     assert projects.json() == {"projects": [{"project_id": "legacy"}]}
+
+
+@pytest.mark.asyncio
+async def test_model_lock_can_be_released_by_event_loop_after_thread_acquire(codebase_env):
+    store = CodebaseIndexStore()
+    first = await asyncio.to_thread(store.acquire_model_lock)
+    first.release()
+    second = await asyncio.to_thread(store.acquire_model_lock)
+    second.release()

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -73,7 +74,7 @@ class CodebaseIndexStore:
         return self.root / project_id
 
     def _lock(self, project_id: str) -> FileLock:
-        return FileLock(str(self.root / f".{project_id}.lock"))
+        return FileLock(str(self.root / f".{project_id}.lock"), thread_local=False)
 
     def _acquire(self, project_id: str) -> FileLock:
         self.validate_project_id(project_id)
@@ -87,7 +88,7 @@ class CodebaseIndexStore:
 
     def acquire_model_lock(self) -> FileLock:
         self.root.mkdir(parents=True, exist_ok=True)
-        lock = FileLock(str(self.root / ".embedding-model.lock"))
+        lock = FileLock(str(self.root / ".embedding-model.lock"), thread_local=False)
         try:
             lock.acquire(timeout=0)
         except Timeout as exc:
@@ -97,17 +98,38 @@ class CodebaseIndexStore:
     @staticmethod
     def configured_roots() -> list[Path]:
         raw = os.getenv("AURORA_CODEBASE_ROOTS", "")
-        return [Path(value).expanduser().resolve() for value in raw.split(os.pathsep) if value.strip()]
+        return [Path(os.path.abspath(os.path.expanduser(value))) for value in raw.split(os.pathsep) if value.strip()]
+
+    @staticmethod
+    def _has_symlink_component(path: Path) -> bool:
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current /= part
+            try:
+                if stat.S_ISLNK(os.lstat(current).st_mode):
+                    return True
+            except FileNotFoundError:
+                continue
+        return False
 
     def _open_confined_directory(self, requested: str) -> tuple[int, Path]:
-        candidate = Path(requested).expanduser()
-        if not candidate.is_absolute():
+        requested_path = Path(os.path.expanduser(requested))
+        if not requested_path.is_absolute():
+            raise RootNotAllowed("path is not allowed")
+        candidate = Path(os.path.abspath(requested_path))
+        if self._has_symlink_component(candidate):
             raise RootNotAllowed("path is not allowed")
         try:
             resolved = candidate.resolve(strict=True)
         except OSError as exc:
             raise RootNotAllowed("path is not allowed") from exc
         for root in self.configured_roots():
+            if self._has_symlink_component(root):
+                raise RootNotAllowed("path is not allowed")
+            try:
+                root = root.resolve(strict=True)
+            except OSError:
+                continue
             try:
                 relative = resolved.relative_to(root)
             except ValueError:
@@ -153,7 +175,7 @@ class CodebaseIndexStore:
                 for rule in pattern.patterns:
                     match = rule.match_file(candidate)
                     if match is not None:
-                        ignored = not match.include
+                        ignored = not rule.include
         return ignored
 
     @staticmethod
@@ -358,7 +380,7 @@ class CodebaseIndexStore:
                     for document, score in legacy.similarity_search_with_relevance_scores(query, k=limit)]
         self.validate_project_id(project_id)
         self.root.mkdir(parents=True, exist_ok=True)
-        lock = FileLock(str(self.root / f".{project_id}.lock"))
+        lock = FileLock(str(self.root / f".{project_id}.lock"), thread_local=False)
         try:
             lock.acquire(timeout=30)
             payload = self._published(project_id)
