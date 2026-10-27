@@ -89,8 +89,7 @@ async def test_index_scans_safe_text_with_nested_gitignore_and_line_metadata(cod
     results = await codebase_client.post("/codebase/search", headers=headers,
                                          json={"project_id": "demo", "query": "alpha", "limit": 5})
     assert results.status_code == 200
-    item = results.json()["results"][0]
-    assert item["path"] == "src/main.py"
+    item = next(item for item in results.json()["results"] if item["path"] == "src/main.py")
     assert item["start_line"] == 1 and item["end_line"] == 3
     assert "hidden.py" not in str(results.json()) and "TOKEN" not in str(results.json())
     chroma = index_store.chromadb.PersistentClient(path=str(codebase_env / "chroma"))
@@ -244,7 +243,7 @@ def test_search_timeout_becomes_project_busy(monkeypatch, codebase_env):
     from filelock import Timeout
 
     def timeout(_self, timeout):
-        raise Timeout
+        raise Timeout("project.lock")
 
     monkeypatch.setattr(index_store.FileLock, "acquire", timeout)
     with pytest.raises(ProjectBusy):

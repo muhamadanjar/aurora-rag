@@ -243,8 +243,8 @@ class CodebaseIndexStore:
                 continue
             if not entry.is_file(follow_symlinks=False):
                 try:
-                    special = (entry.is_fifo() or entry.is_socket() or entry.is_block_device()
-                               or entry.is_char_device())
+                    mode = entry.stat(follow_symlinks=False).st_mode
+                    special = stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISBLK(mode) or stat.S_ISCHR(mode)
                 except OSError as exc:
                     raise ScanError("codebase directory entry could not be inspected") from exc
                 if special:

@@ -27,6 +27,55 @@ The chat request body is capped at 1 MiB before JSON parsing, including unauthen
 
 `embedding.model` can change only while Chroma contains no vectors. Once vectors exist, the API rejects changes; operators must rebuild the collection and re-ingest with the selected model. The `/ingest` and `/query` endpoints keep their existing request/response and authentication behavior, while reading the current runtime configuration for model, prompt, and retrieval settings.
 
+## Codebase indexing and MCP
+
+The codebase API indexes local project directories into project-specific Chroma collections. It is separate from `/ingest`, `/query`, and the existing `source_code` collection. The `legacy` search scope exposes that existing collection; `legacy` is reserved and cannot be indexed or deleted as a project.
+
+Set a strong `AURORA_CODEBASE_TOKEN` and `AURORA_CODEBASE_ROOTS` before starting the API. The latter is a list of absolute allowed directory roots separated by the operating system's path separator (`:` on Linux). All `/codebase` endpoints require `Authorization: Bearer <token>` and fail closed if no token is configured. Keep the token private; bind the API to a trusted interface or use TLS and appropriate network controls.
+
+```bash
+export AURORA_CODEBASE_TOKEN='<strong-random-secret>'
+export AURORA_CODEBASE_ROOTS='/absolute/path/to/projects'
+uvicorn app.main:app --host 127.0.0.1
+```
+
+With Ollama running and the configured embedding model installed, index a project under an allowed root:
+
+```bash
+curl --fail-with-body -X POST 'http://127.0.0.1:8000/codebase/projects/my-project/index' \
+  -H "Authorization: Bearer $AURORA_CODEBASE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"/absolute/path/to/projects/my-project"}'
+```
+
+Indexing is synchronous. A successful re-index publishes a new generation and removes stale source results; failures preserve the published generation. Source paths in project results are relative to the indexed directory, with line ranges. The scanner honors `.gitignore` and excludes symbolic links, known secret files, binary files, dependencies and build output. Large files are skipped and reported in the response. Filename exclusions do not detect secrets embedded in otherwise allowed source files; review a project before indexing it.
+
+| Method and path | Purpose |
+|---|---|
+| `POST /codebase/projects/{project_id}/index` | Index or synchronize a local project. Body: `{"path":"<absolute path>"}`. |
+| `DELETE /codebase/projects/{project_id}` | Remove a project's index. |
+| `GET /codebase/projects` | List indexed project IDs and the `legacy` scope. |
+| `POST /codebase/search` | Search one scope. Body: `{"project_id":"my-project","query":"...","limit":10}`. |
+
+Configure a coding agent to launch the MCP server over stdio. Substitute the absolute Aurora RAG directory and the same bearer token; never commit a real token to project configuration:
+
+```json
+{
+  "mcpServers": {
+    "aurora-rag": {
+      "command": "uv",
+      "args": ["--directory", "/absolute/path/to/aurora-rag", "run", "python", "-m", "codebase_mcp.server"],
+      "env": {
+        "AURORA_RAG_URL": "http://127.0.0.1:8000",
+        "AURORA_CODEBASE_TOKEN": "<same-token-as-api>"
+      }
+    }
+  }
+}
+```
+
+The MCP tools are `list_projects` and `search_codebase`. Search requires an explicit project ID or `legacy` and returns source snippets rather than generated answers. The MCP server does not index or delete projects. Project indexing and retrieval use the runtime `embedding.model`; changing that model is blocked while indexed vectors exist.
+
 ## Dataset management
 
 Dataset management remains a separate authenticated PostgreSQL-backed feature. It does not create chat sessions or training examples from chat traffic and does not automate Ollama training.

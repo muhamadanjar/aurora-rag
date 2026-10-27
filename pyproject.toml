@@ -77,6 +77,7 @@ dependencies = [
     "ormsgpack==1.12.2",
     "overrides==7.7.0",
     "packaging==26.3",
+    "pathspec>=0.12,<1",
     "propcache==0.5.2",
     "protobuf==7.36.1",
     "pybase64==1.5.0",
@@ -123,6 +124,3 @@ dependencies = [
     "yarl==1.24.5",
     "zstandard==0.25.0",
 ]
-
-[project.scripts]
-aurora-codebase-mcp = "codebase_mcp.server:main"

@@ -181,8 +181,8 @@ async def search_codebase(project_id: str, query: str, limit: int = 10) -> list[
         raise ToolError("project_id must be an explicitly selected project identifier or 'legacy'")
     if not isinstance(query, str) or not query.strip():
         raise ToolError("query must not be empty")
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
-        raise ToolError("limit must be an integer between 1 and 100")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+        raise ToolError("limit must be an integer between 1 and 50")
 
     return await _with_client(lambda client: client.search(project_id=project_id, query=query, limit=limit))
 
