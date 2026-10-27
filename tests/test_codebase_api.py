@@ -79,6 +79,9 @@ async def test_index_scans_safe_text_with_nested_gitignore_and_line_metadata(cod
     (root / "src" / "drop.py").write_text("dropped", encoding="utf-8")
     (nested / "hidden.py").write_text("should not be indexed", encoding="utf-8")
     (root / ".env").write_text("TOKEN=do-not-index", encoding="utf-8")
+    (root / "Secrets").mkdir()
+    (root / "Secrets" / "password.json").write_text("sensitive password", encoding="utf-8")
+    (root / "credentials.json").write_text("sensitive credentials", encoding="utf-8")
     (root / "image.bin").write_bytes(b"\x00binary")
     (root / "link.py").symlink_to(root / "src" / "main.py")
     headers = {"Authorization": "Bearer codebase-test-token"}

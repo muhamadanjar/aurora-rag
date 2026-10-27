@@ -30,9 +30,11 @@ MAX_GITIGNORE_RULES = 10_000
 CHUNK_LINES = 80
 CHUNK_OVERLAP = 10
 IGNORED_DIRS = {".git", ".hg", ".svn", ".idea", ".venv", "venv", "__pycache__",
-                "node_modules", "vendor", "dist", "build", "target", ".tox"}
-SECRET_NAMES = {".env", "credentials", "secrets", "id_rsa", "id_dsa", "id_ed25519"}
-SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".secret", ".crt", ".der")
+                "node_modules", "vendor", "dist", "build", "target", ".tox",
+                ".ssh", ".aws", "secrets", "credentials"}
+SECRET_NAMES = {".env", ".npmrc", ".pypirc", "credentials", "credentials.json",
+                "secrets", "secrets.json", "id_rsa", "id_dsa", "id_ed25519"}
+SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".secret", ".crt", ".der", ".tfstate")
 TEXT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go", ".rs",
                  ".c", ".h", ".cpp", ".hpp", ".cs", ".php", ".rb", ".swift", ".scala",
                  ".sql", ".sh", ".bash", ".zsh", ".fish", ".lua", ".dart", ".ex", ".exs",
@@ -229,7 +231,7 @@ class CodebaseIndexStore:
             if entry.is_symlink():
                 continue
             if entry.is_dir(follow_symlinks=False):
-                if entry.name in IGNORED_DIRS or self._ignored(child, rules, is_dir=True):
+                if entry.name.lower() in IGNORED_DIRS or self._ignored(child, rules, is_dir=True):
                     continue
                 try:
                     child_fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
