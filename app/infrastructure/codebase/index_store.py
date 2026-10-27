@@ -175,11 +175,13 @@ class CodebaseIndexStore:
                 if line.strip() and not line.lstrip().startswith("#")]
 
     @staticmethod
-    def _ignored(relative: str, rules: list[tuple[str, PathSpec]]) -> bool:
+    def _ignored(relative: str, rules: list[tuple[str, PathSpec]], *, is_dir: bool = False) -> bool:
         ignored = False
         for base, pattern in rules:
             candidate = relative if not base else relative.removeprefix(f"{base}/")
-            if candidate == relative or relative.startswith(f"{base}/"):
+            if is_dir:
+                candidate += "/"
+            if not base or relative == base or relative.startswith(f"{base}/"):
                 for rule in pattern.patterns:
                     match = rule.match_file(candidate)
                     if match is not None:
@@ -226,7 +228,7 @@ class CodebaseIndexStore:
             if entry.is_symlink():
                 continue
             if entry.is_dir(follow_symlinks=False):
-                if entry.name in IGNORED_DIRS:
+                if entry.name in IGNORED_DIRS or self._ignored(child, rules, is_dir=True):
                     continue
                 try:
                     child_fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
@@ -401,7 +403,10 @@ class CodebaseIndexStore:
         self.root.mkdir(parents=True, exist_ok=True)
         lock = FileLock(str(self.root / f".{project_id}.lock"), thread_local=False)
         try:
-            lock.acquire(timeout=30)
+            try:
+                lock.acquire(timeout=30)
+            except Timeout as exc:
+                raise ProjectBusy("project operation already in progress") from exc
             payload = self._published(project_id)
             if not payload:
                 return []

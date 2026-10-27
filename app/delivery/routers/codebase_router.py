@@ -84,6 +84,8 @@ async def search_codebase(body: CodebaseSearchRequest, _: None = Depends(require
             embedding_model=configuration["embedding.model"],
         )
         return {"results": results}
+    except ProjectBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except InvalidProject as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (OSError, RuntimeError) as exc:

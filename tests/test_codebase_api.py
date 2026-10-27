@@ -219,3 +219,49 @@ async def test_model_lock_can_be_released_by_event_loop_after_thread_acquire(cod
     first.release()
     second = await asyncio.to_thread(store.acquire_model_lock)
     second.release()
+
+
+@pytest.mark.asyncio
+async def test_directory_only_ignore_skips_unreadable_special_children(codebase_client, codebase_env):
+    root = codebase_env / "roots" / "ignored-directory"
+    ignored = root / "ignored"
+    ignored.mkdir(parents=True)
+    (root / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    (root / "main.py").write_text("indexed", encoding="utf-8")
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO test requires mkfifo")
+    os.mkfifo(ignored / "blocked.py")
+    response = await codebase_client.post(
+        "/codebase/projects/ignored-directory/index",
+        headers={"Authorization": "Bearer codebase-test-token"},
+        json={"path": str(root)},
+    )
+    assert response.status_code == 200
+    assert response.json()["indexed_chunks"] == 1
+
+
+def test_search_timeout_becomes_project_busy(monkeypatch, codebase_env):
+    from filelock import Timeout
+
+    def timeout(_self, timeout):
+        raise Timeout
+
+    monkeypatch.setattr(index_store.FileLock, "acquire", timeout)
+    with pytest.raises(ProjectBusy):
+        CodebaseIndexStore().search("demo", "query", 1)
+
+
+@pytest.mark.asyncio
+async def test_search_project_busy_is_http_409(codebase_client, monkeypatch):
+    from app.delivery.routers import codebase_router
+
+    def busy(*args, **kwargs):
+        raise ProjectBusy("project operation already in progress")
+
+    monkeypatch.setattr(codebase_router.CodebaseService, "search", busy)
+    response = await codebase_client.post(
+        "/codebase/search",
+        headers={"Authorization": "Bearer codebase-test-token"},
+        json={"project_id": "demo", "query": "query", "limit": 1},
+    )
+    assert response.status_code == 409
