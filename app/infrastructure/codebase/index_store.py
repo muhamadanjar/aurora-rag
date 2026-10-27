@@ -1,22 +1,20 @@
-"""Atomic, filesystem-backed generations for project source indexes.
-
-The store deliberately does not use the legacy Chroma collection. Published
-generation files are immutable; the current-generation pointer is replaced in
-one filesystem operation only after a complete scan and embedding build.
-"""
+"""Project-scoped Chroma generations and race-resistant source scanning."""
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
-import math
 import os
 import re
 import secrets
 from pathlib import Path
 from typing import Any
 
+import chromadb
 from filelock import FileLock, Timeout
 from langchain_community.embeddings import OllamaEmbeddings
+from pathspec import PathSpec
 
 from app.application.rag.config_service import DEFAULT_CONFIGURATION
 
@@ -26,23 +24,16 @@ DEFAULT_INDEX_ROOT = Path("./data/codebase_index")
 DEFAULT_MAX_FILE_BYTES = 1_048_576
 CHUNK_LINES = 80
 CHUNK_OVERLAP = 10
-IGNORED_DIRS = {
-    ".git", ".hg", ".svn", ".idea", ".venv", "venv", "__pycache__",
-    "node_modules", "vendor", "dist", "build", "target", ".tox",
-}
-SECRET_NAMES = {
-    ".env", ".env.local", ".env.production", ".env.development",
-    "id_rsa", "id_dsa", "id_ed25519", "credentials", "secrets",
-}
+IGNORED_DIRS = {".git", ".hg", ".svn", ".idea", ".venv", "venv", "__pycache__",
+                "node_modules", "vendor", "dist", "build", "target", ".tox"}
+SECRET_NAMES = {".env", "credentials", "secrets", "id_rsa", "id_dsa", "id_ed25519"}
 SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".secret", ".crt", ".der")
-TEXT_SUFFIXES = {
-    ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go", ".rs",
-    ".c", ".h", ".cpp", ".hpp", ".cs", ".php", ".rb", ".swift", ".scala",
-    ".sql", ".sh", ".bash", ".zsh", ".fish", ".lua", ".dart", ".ex", ".exs",
-    ".erl", ".hrl", ".fs", ".fsx", ".m", ".mm", ".html", ".css", ".scss",
-    ".vue", ".svelte", ".json", ".yaml", ".yml", ".toml", ".ini", ".xml",
-    ".md", ".rst", ".txt", ".graphql", ".proto", ".dockerfile",
-}
+TEXT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go", ".rs",
+                 ".c", ".h", ".cpp", ".hpp", ".cs", ".php", ".rb", ".swift", ".scala",
+                 ".sql", ".sh", ".bash", ".zsh", ".fish", ".lua", ".dart", ".ex", ".exs",
+                 ".erl", ".hrl", ".fs", ".fsx", ".m", ".mm", ".html", ".css", ".scss",
+                 ".vue", ".svelte", ".json", ".yaml", ".yml", ".toml", ".ini", ".xml",
+                 ".md", ".rst", ".txt", ".graphql", ".proto", ".dockerfile"}
 
 
 class CodebaseIndexError(Exception):
@@ -61,14 +52,19 @@ class RootNotAllowed(CodebaseIndexError):
     pass
 
 
+class ScanError(CodebaseIndexError):
+    pass
+
+
 class CodebaseIndexStore:
     def __init__(self, *, index_root: Path | None = None, max_file_bytes: int = DEFAULT_MAX_FILE_BYTES):
         self.root = Path(os.getenv("AURORA_CODEBASE_INDEX_ROOT", str(index_root or DEFAULT_INDEX_ROOT))).resolve()
+        self.chroma_root = Path(os.getenv("AURORA_CODEBASE_CHROMA_ROOT", str(self.root / "chroma"))).resolve()
         self.max_file_bytes = max_file_bytes
 
     @staticmethod
     def validate_project_id(project_id: str) -> str:
-        if not PROJECT_ID_RE.fullmatch(project_id):
+        if project_id == LEGACY_PROJECT_ID or not PROJECT_ID_RE.fullmatch(project_id):
             raise InvalidProject("invalid project id")
         return project_id
 
@@ -80,6 +76,7 @@ class CodebaseIndexStore:
         return FileLock(str(self.root / f".{project_id}.lock"))
 
     def _acquire(self, project_id: str) -> FileLock:
+        self.validate_project_id(project_id)
         self.root.mkdir(parents=True, exist_ok=True)
         lock = self._lock(project_id)
         try:
@@ -88,16 +85,23 @@ class CodebaseIndexStore:
             raise ProjectBusy("project operation already in progress") from exc
         return lock
 
+    def acquire_model_lock(self) -> FileLock:
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(str(self.root / ".embedding-model.lock"))
+        try:
+            lock.acquire(timeout=0)
+        except Timeout as exc:
+            raise ProjectBusy("embedding model operation already in progress") from exc
+        return lock
+
     @staticmethod
     def configured_roots() -> list[Path]:
         raw = os.getenv("AURORA_CODEBASE_ROOTS", "")
         return [Path(value).expanduser().resolve() for value in raw.split(os.pathsep) if value.strip()]
 
-    def _confined_path(self, requested: str) -> tuple[Path, Path]:
+    def _open_confined_directory(self, requested: str) -> tuple[int, Path]:
         candidate = Path(requested).expanduser()
         if not candidate.is_absolute():
-            raise RootNotAllowed("path is not allowed")
-        if any(part.is_symlink() for part in (candidate, *candidate.parents)):
             raise RootNotAllowed("path is not allowed")
         try:
             resolved = candidate.resolve(strict=True)
@@ -105,81 +109,134 @@ class CodebaseIndexStore:
             raise RootNotAllowed("path is not allowed") from exc
         for root in self.configured_roots():
             try:
-                return root, resolved.relative_to(root)
+                relative = resolved.relative_to(root)
             except ValueError:
                 continue
+            fd = None
+            try:
+                fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                for part in relative.parts:
+                    next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    os.close(fd)
+                    fd = next_fd
+                return fd, relative
+            except OSError as exc:
+                if fd is not None:
+                    os.close(fd)
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise RootNotAllowed("path is not allowed") from exc
+                raise ScanError("codebase path could not be opened") from exc
         raise RootNotAllowed("path is not allowed")
 
     @staticmethod
-    def _gitignore_patterns(directory: Path) -> list[str]:
+    def _load_gitignore(fd: int, base: str) -> list[tuple[str, PathSpec]]:
         try:
-            return [line.strip() for line in (directory / ".gitignore").read_text(encoding="utf-8").splitlines()
-                    if line.strip() and not line.lstrip().startswith("#")]
-        except (OSError, UnicodeDecodeError):
+            ignore_fd = os.open(".gitignore", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+        except FileNotFoundError:
             return []
+        except OSError as exc:
+            raise ScanError("codebase ignore rules could not be read") from exc
+        try:
+            with os.fdopen(ignore_fd, "r", encoding="utf-8") as handle:
+                lines = [line.rstrip("\n\r") for line in handle]
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ScanError("codebase ignore rules could not be read") from exc
+        return [(base, PathSpec.from_lines("gitwildmatch", [line.strip()])) for line in lines
+                if line.strip() and not line.lstrip().startswith("#")]
 
     @staticmethod
-    def _ignored(path: Path, base: Path, patterns: list[str]) -> bool:
-        relative = path.relative_to(base).as_posix()
-        name = path.name
-        for pattern in patterns:
-            negated = pattern.startswith("!")
-            pattern = pattern[1:] if negated else pattern
-            if pattern.endswith("/"):
-                pattern = pattern[:-1]
-            matched = path.match(pattern) or Path(relative).match(pattern) or name == pattern
-            if matched and not negated:
-                return True
-        return False
-
-    def _iter_files(self, base: Path):
-        stack = [(base, self._gitignore_patterns(base))]
-        while stack:
-            directory, inherited = stack.pop()
-            try:
-                entries = sorted(directory.iterdir(), key=lambda item: item.name)
-            except OSError:
-                continue
-            patterns = inherited + self._gitignore_patterns(directory)
-            for entry in entries:
-                if entry.is_symlink():
-                    continue
-                if entry.is_dir():
-                    if entry.name in IGNORED_DIRS or self._ignored(entry, base, patterns):
-                        continue
-                    stack.append((entry, patterns))
-                elif entry.is_file() and entry.name != ".gitignore" and not self._ignored(entry, base, patterns):
-                    yield entry
+    def _ignored(relative: str, rules: list[tuple[str, PathSpec]]) -> bool:
+        ignored = False
+        for base, pattern in rules:
+            candidate = relative if not base else relative.removeprefix(f"{base}/")
+            if candidate == relative or relative.startswith(f"{base}/"):
+                for rule in pattern.patterns:
+                    match = rule.match_file(candidate)
+                    if match is not None:
+                        ignored = not match.include
+        return ignored
 
     @staticmethod
-    def _is_secret(path: Path) -> bool:
-        name = path.name.lower()
-        return name in SECRET_NAMES or name.startswith(".env") or name.endswith(SECRET_SUFFIXES)
+    def _is_secret(name: str) -> bool:
+        lower = name.lower()
+        return lower in SECRET_NAMES or lower.startswith(".env") or lower.endswith(SECRET_SUFFIXES)
 
-    def _chunks(self, base: Path) -> tuple[list[dict[str, Any]], int]:
-        chunks: list[dict[str, Any]] = []
-        skipped = 0
-        for path in self._iter_files(base):
-            if self._is_secret(path):
+    def _read_source(self, fd: int, relative: str) -> tuple[str | None, bool]:
+        try:
+            stat = os.fstat(fd)
+            if stat.st_size > self.max_file_bytes:
+                return None, True
+            data = bytearray()
+            while len(data) <= self.max_file_bytes:
+                block = os.read(fd, min(131_072, self.max_file_bytes + 1 - len(data)))
+                if not block:
+                    break
+                data.extend(block)
+            if len(data) > self.max_file_bytes:
+                return None, True
+            if b"\x00" in data:
+                return None, False
+            return bytes(data).decode("utf-8"), False
+        except UnicodeDecodeError:
+            return None, False
+        except OSError as exc:
+            raise ScanError("codebase file could not be read") from exc
+
+    def _scan_directory(self, fd: int, relative: str, rules: list[tuple[str, PathSpec]],
+                        files: list[tuple[str, str]], skipped: list[str]) -> None:
+        rules = rules + self._load_gitignore(fd, relative)
+        try:
+            entries = sorted(os.scandir(fd), key=lambda entry: entry.name)
+        except OSError as exc:
+            raise ScanError("codebase directory could not be read") from exc
+        for entry in entries:
+            child = f"{relative}/{entry.name}" if relative else entry.name
+            if entry.is_symlink():
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                if entry.name in IGNORED_DIRS:
+                    continue
+                try:
+                    child_fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except OSError as exc:
+                    raise ScanError("codebase directory could not be opened") from exc
+                try:
+                    self._scan_directory(child_fd, child, rules, files, skipped)
+                finally:
+                    os.close(child_fd)
+                continue
+            if not entry.is_file(follow_symlinks=False) or entry.name == ".gitignore" or self._ignored(child, rules):
+                continue
+            if self._is_secret(entry.name):
                 continue
             try:
-                if path.stat().st_size > self.max_file_bytes:
-                    skipped += 1
-                    continue
-                raw = path.read_bytes()
-                if b"\x00" in raw:
-                    continue
-                text = raw.decode("utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            if path.suffix.lower() not in TEXT_SUFFIXES and not ("." not in path.name):
-                continue
+                file_fd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError as exc:
+                raise ScanError("codebase file could not be opened") from exc
+            try:
+                text, was_skipped = self._read_source(file_fd, child)
+            finally:
+                os.close(file_fd)
+            if was_skipped:
+                skipped.append(child)
+            if text is not None and (Path(entry.name).suffix.lower() in TEXT_SUFFIXES or "." not in entry.name):
+                files.append((child, text))
+
+    def _chunks(self, fd: int) -> tuple[list[dict[str, Any]], list[str]]:
+        files: list[tuple[str, str]] = []
+        skipped: list[str] = []
+        try:
+            self._scan_directory(fd, "", [], files, skipped)
+        finally:
+            os.close(fd)
+        chunks = []
+        for path, text in files:
             lines = text.splitlines()
             for start in range(0, len(lines), CHUNK_LINES - CHUNK_OVERLAP):
                 body = lines[start:start + CHUNK_LINES]
                 if not body:
                     break
-                chunks.append({"content": "\n".join(body), "path": path.relative_to(base).as_posix(),
+                chunks.append({"content": "\n".join(body), "path": path,
                                "start_line": start + 1, "end_line": start + len(body)})
                 if start + CHUNK_LINES >= len(lines):
                     break
@@ -189,41 +246,96 @@ class CodebaseIndexStore:
     def _embedding_model() -> str:
         return os.getenv("AURORA_CODEBASE_EMBEDDING_MODEL", DEFAULT_CONFIGURATION["embedding.model"])
 
-    def _embed(self, texts: list[str], model: str) -> list[list[float]]:
-        return OllamaEmbeddings(model=model).embed_documents(texts)
+    @staticmethod
+    def _collection_name(project_id: str, generation: str) -> str:
+        digest = hashlib.sha256(f"{project_id}:{generation}".encode()).hexdigest()[:48]
+        return f"aurora_codebase_{digest}"
 
-    def index(self, project_id: str, requested_path: str, *, embedding_model: str | None = None) -> dict[str, int | str]:
-        self.validate_project_id(project_id)
-        base_root, relative = self._confined_path(requested_path)
-        base = (base_root / relative).resolve()
-        if not base.is_dir():
-            raise RootNotAllowed("path is not allowed")
-        lock = self._acquire(project_id)
+    def _client(self):
+        self.chroma_root.mkdir(parents=True, exist_ok=True)
+        return chromadb.PersistentClient(path=str(self.chroma_root))
+
+    def _metadata_path(self, project_id: str) -> Path:
+        return self._project_dir(project_id) / "current"
+
+    def _cleanup_project_collections(self, project_id: str, *, keep: str | None = None) -> None:
+        client = self._client()
+        for item in client.list_collections():
+            name = item if isinstance(item, str) else item.name
+            collection = item if not isinstance(item, str) else client.get_collection(name)
+            metadata = collection.metadata or {}
+            if metadata.get("project_id") == project_id and name != keep:
+                client.delete_collection(name)
+
+    def _published(self, project_id: str) -> dict[str, Any] | None:
         try:
-            chunks, skipped = self._chunks(base)
+            return json.loads(self._metadata_path(project_id).read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+
+    def index(self, project_id: str, requested_path: str, *, embedding_model: str | None = None,
+              model_lock_held: bool = False) -> dict[str, int | str | list[str]]:
+        self.validate_project_id(project_id)
+        lock = None
+        model_lock = None
+        collection_name = None
+        try:
+            if not model_lock_held:
+                model_lock = self.acquire_model_lock()
+            lock = self._acquire(project_id)
+            fd, _ = self._open_confined_directory(requested_path)
+            current = self._published(project_id)
+            self._cleanup_project_collections(project_id, keep=current.get("collection_name") if current else None)
+            chunks, skipped = self._chunks(fd)
             model = embedding_model or self._embedding_model()
-            vectors = self._embed([item["content"] for item in chunks], model) if chunks else []
             generation = secrets.token_hex(16)
-            payload = {"project_id": project_id, "embedding_model": model,
-                       "chunks": [dict(item, embedding=vector) for item, vector in zip(chunks, vectors)]}
+            collection_name = self._collection_name(project_id, generation)
+            client = self._client()
+            collection = client.create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine", "project_id": project_id,
+                          "generation": generation, "embedding_model": model},
+            )
+            if chunks:
+                vectors = OllamaEmbeddings(model=model).embed_documents([item["content"] for item in chunks])
+                collection.add(
+                    ids=[f"{generation}:{index}" for index in range(len(chunks))],
+                    embeddings=vectors,
+                    documents=[item["content"] for item in chunks],
+                    metadatas=[{key: value for key, value in item.items() if key != "content"} for item in chunks],
+                )
             directory = self._project_dir(project_id)
             directory.mkdir(parents=True, exist_ok=True)
-            temp = directory / f".generation-{generation}.tmp"
-            final = directory / f"generation-{generation}.json"
-            temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            os.replace(temp, final)
-            pointer = directory / "current"
-            pointer_temp = directory / f".current-{generation}.tmp"
-            pointer_temp.write_text(generation, encoding="ascii")
-            os.replace(pointer_temp, pointer)
-            return {"project_id": project_id, "indexed_chunks": len(chunks), "skipped_files": skipped}
+            metadata = {"project_id": project_id, "generation": generation,
+                        "collection_name": collection_name, "embedding_model": model}
+            temporary = directory / f".current-{generation}.tmp"
+            temporary.write_text(json.dumps(metadata), encoding="utf-8")
+            os.replace(temporary, self._metadata_path(project_id))
+            try:
+                self._cleanup_project_collections(project_id, keep=collection_name)
+            except Exception:
+                pass
+            return {"project_id": project_id, "indexed_chunks": len(chunks),
+                    "skipped_files": len(skipped), "skipped_paths": skipped}
+        except Exception:
+            if collection_name is not None:
+                try:
+                    self._client().delete_collection(collection_name)
+                except Exception:
+                    pass
+            raise
         finally:
-            lock.release()
+            if model_lock is not None:
+                model_lock.release()
+            if lock is not None:
+                lock.release()
 
     def delete(self, project_id: str) -> None:
-        import shutil
+        self.validate_project_id(project_id)
         lock = self._acquire(project_id)
         try:
+            self._cleanup_project_collections(project_id)
+            import shutil
             shutil.rmtree(self._project_dir(project_id), ignore_errors=True)
         finally:
             lock.release()
@@ -232,52 +344,60 @@ class CodebaseIndexStore:
         if not self.root.exists():
             return [LEGACY_PROJECT_ID]
         return [LEGACY_PROJECT_ID] + sorted(item.name for item in self.root.iterdir()
-                                            if item.is_dir() and PROJECT_ID_RE.fullmatch(item.name))
-
-    def _published(self, project_id: str) -> dict[str, Any] | None:
-        current = self._project_dir(project_id) / "current"
-        try:
-            generation = current.read_text(encoding="ascii").strip()
-            return json.loads((self._project_dir(project_id) / f"generation-{generation}.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
-            return None
+                                            if item.is_dir() and PROJECT_ID_RE.fullmatch(item.name)
+                                            and item.name != LEGACY_PROJECT_ID)
 
     def search(self, project_id: str, query: str, limit: int, *, embedding_model: str | None = None) -> list[dict[str, Any]]:
         if project_id == LEGACY_PROJECT_ID:
             from langchain_chroma import Chroma
-
-            store = Chroma(
-                collection_name="source_code",
-                embedding_function=OllamaEmbeddings(model=embedding_model or self._embedding_model()),
-                persist_directory="./data/chroma_data",
+            legacy = Chroma(collection_name="source_code",
+                            embedding_function=OllamaEmbeddings(model=embedding_model or self._embedding_model()),
+                            persist_directory="./data/chroma_data")
+            return [{"content": document.page_content, "path": Path(str(document.metadata.get("source", ""))).name,
+                     "start_line": None, "end_line": None, "score": float(score)}
+                    for document, score in legacy.similarity_search_with_relevance_scores(query, k=limit)]
+        self.validate_project_id(project_id)
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(str(self.root / f".{project_id}.lock"))
+        try:
+            lock.acquire(timeout=30)
+            payload = self._published(project_id)
+            if not payload:
+                return []
+            vector = OllamaEmbeddings(model=payload["embedding_model"]).embed_query(query)
+            result = self._client().get_collection(payload["collection_name"]).query(
+                query_embeddings=[vector], n_results=limit, include=["documents", "metadatas", "distances"]
             )
-            return [
-                {"content": document.page_content, "path": Path(str(document.metadata.get("source", ""))).name,
-                 "start_line": None, "end_line": None, "score": float(score)}
-                for document, score in store.similarity_search_with_relevance_scores(query, k=limit)
-            ]
-        payload = self._published(project_id)
-        if payload is None:
-            return []
-        vectors = self._embed([query], payload["embedding_model"])[0]
-        scored = []
-        for chunk in payload["chunks"]:
-            left, right = vectors, chunk["embedding"]
-            denominator = math.sqrt(sum(value * value for value in left)) * math.sqrt(sum(value * value for value in right))
-            score = sum(a * b for a, b in zip(left, right)) / denominator if denominator else 0.0
-            scored.append((score, chunk))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return [dict(chunk, score=float(score)) for score, chunk in scored[:limit]]
+            documents = result.get("documents", [[]])[0]
+            metadatas = result.get("metadatas", [[]])[0]
+            distances = result.get("distances", [[]])[0]
+            return [{"content": content, "path": metadata.get("path", ""),
+                     "start_line": metadata.get("start_line"), "end_line": metadata.get("end_line"),
+                     "score": float(1 - distance)}
+                    for content, metadata, distance in zip(documents, metadatas, distances)]
+        finally:
+            if lock.is_locked:
+                lock.release()
 
     def has_published_chunks(self) -> bool:
-        return any((self._project_dir(project) / "current").exists() and self._published(project)
-                   and self._published(project).get("chunks") for project in self.projects() if project != LEGACY_PROJECT_ID)
+        client = self._client()
+        for project in self.projects():
+            if project == LEGACY_PROJECT_ID:
+                continue
+            payload = self._published(project)
+            if payload and client.get_collection(payload["collection_name"]).count() > 0:
+                return True
+        return False
 
 
 def published_chunk_count() -> int:
-    try:
-        store = CodebaseIndexStore()
-        return sum(len(store._published(project).get("chunks", [])) for project in store.projects()
-                   if project != LEGACY_PROJECT_ID and store._published(project))
-    except OSError:
-        return 0
+    store = CodebaseIndexStore()
+    client = store._client()
+    total = 0
+    for project in store.projects():
+        if project == LEGACY_PROJECT_ID:
+            continue
+        payload = store._published(project)
+        if payload:
+            total += client.get_collection(payload["collection_name"]).count()
+    return total

@@ -1,3 +1,6 @@
+import asyncio
+import threading
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -44,12 +47,34 @@ async def test_codebase_endpoints_fail_closed_and_require_exact_bearer(codebase_
 
 
 @pytest.mark.asyncio
+async def test_codebase_body_limit_runs_before_auth_and_json_parsing(codebase_client):
+    from app.delivery.middleware import MAX_CODEBASE_REQUEST_BODY_BYTES
+
+    async def chunks():
+        payload = b'{"project_id":"demo","query":"' + b"x" * (MAX_CODEBASE_REQUEST_BODY_BYTES + 32) + b'","limit":1}'
+        for offset in range(0, len(payload), 4096):
+            yield payload[offset:offset + 4096]
+
+    unauthenticated = await codebase_client.post("/codebase/search", content=chunks(),
+                                                 headers={"Content-Type": "application/json"})
+    assert unauthenticated.status_code == 413
+    authenticated = await codebase_client.post(
+        "/codebase/projects/demo/index", content=chunks(),
+        headers={"Authorization": "Bearer codebase-test-token", "Content-Type": "application/json"},
+    )
+    assert authenticated.status_code == 413
+
+
+@pytest.mark.asyncio
 async def test_index_scans_safe_text_with_nested_gitignore_and_line_metadata(codebase_client, codebase_env):
     root = codebase_env / "roots" / "repo"
     nested = root / "src" / "ignored"
     nested.mkdir(parents=True)
     (root / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    (root / "src" / ".gitignore").write_text("drop.py\n!keep.py\n", encoding="utf-8")
     (root / "src" / "main.py").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    (root / "src" / "keep.py").write_text("kept", encoding="utf-8")
+    (root / "src" / "drop.py").write_text("dropped", encoding="utf-8")
     (nested / "hidden.py").write_text("should not be indexed", encoding="utf-8")
     (root / ".env").write_text("TOKEN=do-not-index", encoding="utf-8")
     (root / "image.bin").write_bytes(b"\x00binary")
@@ -58,7 +83,7 @@ async def test_index_scans_safe_text_with_nested_gitignore_and_line_metadata(cod
 
     response = await codebase_client.post("/codebase/projects/demo/index", headers=headers, json={"path": str(root)})
     assert response.status_code == 200
-    assert response.json()["indexed_chunks"] == 1
+    assert response.json()["indexed_chunks"] == 2
     results = await codebase_client.post("/codebase/search", headers=headers,
                                          json={"project_id": "demo", "query": "alpha", "limit": 5})
     assert results.status_code == 200
@@ -83,14 +108,45 @@ async def test_reindex_removes_stale_chunks_and_failed_build_keeps_published_gen
                                          json={"project_id": "demo", "query": "new", "limit": 5})
     assert all("old marker" not in item["content"] for item in results.json()["results"])
 
-    original_embed = index_store.CodebaseIndexStore._embed
-    monkeypatch.setattr(index_store.CodebaseIndexStore, "_embed", lambda *args: (_ for _ in ()).throw(RuntimeError("ollama down")))
+    original_embed = index_store.OllamaEmbeddings.embed_documents
+    monkeypatch.setattr(index_store.OllamaEmbeddings, "embed_documents",
+                        lambda *args: (_ for _ in ()).throw(RuntimeError("ollama down")))
     failed = await codebase_client.post("/codebase/projects/demo/index", headers=headers, json={"path": str(root)})
     assert failed.status_code == 502
-    monkeypatch.setattr(index_store.CodebaseIndexStore, "_embed", original_embed)
+    monkeypatch.setattr(index_store.OllamaEmbeddings, "embed_documents", original_embed)
     preserved = await codebase_client.post("/codebase/search", headers=headers,
                                            json={"project_id": "demo", "query": "new", "limit": 5})
     assert preserved.json()["results"]
+    chroma = index_store.chromadb.PersistentClient(path=str(codebase_env / "index" / "chroma"))
+    names = [item if isinstance(item, str) else item.name for item in chroma.list_collections()]
+    assert len([name for name in names if name.startswith("aurora_codebase_")]) == 1
+
+
+@pytest.mark.asyncio
+async def test_same_project_http_indexes_conflict_without_blocking_event_loop(codebase_client, codebase_env, monkeypatch):
+    root = codebase_env / "roots" / "repo"
+    root.mkdir()
+    (root / "main.py").write_text("content", encoding="utf-8")
+    headers = {"Authorization": "Bearer codebase-test-token"}
+    started = threading.Event()
+    release = threading.Event()
+    original = index_store.OllamaEmbeddings.embed_documents
+
+    def blocking_embed(self, texts):
+        started.set()
+        release.wait(timeout=2)
+        return original(self, texts)
+
+    monkeypatch.setattr(index_store.OllamaEmbeddings, "embed_documents", blocking_embed)
+    first = asyncio.create_task(codebase_client.post("/codebase/projects/demo/index", headers=headers,
+                                                     json={"path": str(root)}))
+    assert await asyncio.to_thread(started.wait, 1)
+    second = await codebase_client.post("/codebase/projects/demo/index", headers=headers,
+                                        json={"path": str(root)})
+    release.set()
+    first_response = await first
+    assert first_response.status_code == 200
+    assert second.status_code == 409
 
 
 def test_same_project_operations_are_rejected_across_workers(codebase_env):
@@ -106,6 +162,9 @@ def test_same_project_operations_are_rejected_across_workers(codebase_env):
 @pytest.mark.asyncio
 async def test_path_confinement_and_project_listing(codebase_client, codebase_env):
     headers = {"Authorization": "Bearer codebase-test-token"}
+    assert (await codebase_client.post("/codebase/projects/legacy/index", headers=headers,
+                                       json={"path": str(codebase_env / "roots")})).status_code == 422
+    assert (await codebase_client.delete("/codebase/projects/legacy", headers=headers)).status_code == 422
     outside = codebase_env / "outside"
     outside.mkdir()
     rejected = await codebase_client.post("/codebase/projects/../bad/index", headers=headers, json={"path": str(outside)})

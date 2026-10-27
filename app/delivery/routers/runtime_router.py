@@ -6,6 +6,7 @@ from fastapi.responses import StreamingResponse
 from app.application.rag.chat_service import ChatService
 from app.application.rag.runtime_config_service import RuntimeConfigService
 from app.core.exceptions import ChatUnavailable
+from app.core.exceptions import ResourceConflict
 from app.delivery.dependencies import current_operator, get_uow
 from app.delivery.schemas.rag import ChatCompletionRequest, ConfigurationUpdate
 from app.domain.rag.entities import ChatMessage
@@ -16,6 +17,7 @@ from app.infrastructure.rag.vector_store import (
     indexed_codebase_count,
     indexed_vector_count,
 )
+from app.infrastructure.codebase.index_store import CodebaseIndexStore, ProjectBusy
 
 router = APIRouter(prefix="/api/v1", tags=["runtime configuration", "chat"])
 
@@ -42,9 +44,13 @@ async def update_configuration(
     uow: UnitOfWork = Depends(get_uow),
     actor=Depends(current_operator),
 ):
-    entry = await RuntimeConfigService(
-        uow, vector_count=lambda: max(indexed_vector_count(), indexed_codebase_count())
-    ).update(key, body.value)
+    try:
+        entry = await RuntimeConfigService(
+            uow, vector_count=lambda: max(indexed_vector_count(), indexed_codebase_count()),
+            model_lock_factory=CodebaseIndexStore().acquire_model_lock,
+        ).update(key, body.value)
+    except ProjectBusy as exc:
+        raise ResourceConflict("embedding model operation already in progress") from exc
     return {"id": str(entry.id), "key": entry.key, "value": entry.value}
 
 

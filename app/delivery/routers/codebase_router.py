@@ -1,5 +1,6 @@
 import hmac
 import os
+import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -13,9 +14,8 @@ from app.delivery.schemas.codebase import (
     CodebaseIndexRequest, CodebaseProjectListResponse, CodebaseSearchRequest,
     CodebaseSearchResponse,
 )
-from app.infrastructure.codebase.index_store import (
-    CodebaseIndexError, InvalidProject, ProjectBusy, RootNotAllowed,
-)
+from app.infrastructure.codebase.index_store import (CodebaseIndexError, CodebaseIndexStore,
+                                                       InvalidProject, ProjectBusy, RootNotAllowed)
 
 router = APIRouter(prefix="/codebase", tags=["codebase"])
 _bearer = HTTPBearer(auto_error=False)
@@ -36,9 +36,15 @@ def _service() -> CodebaseService:
 @router.post("/projects/{project_id}/index")
 async def index_project(project_id: str, body: CodebaseIndexRequest, _: None = Depends(require_codebase_token),
                         uow: UnitOfWork | None = Depends(get_optional_uow)):
+    store = CodebaseIndexStore()
+    model_lock = None
     try:
+        model_lock = await asyncio.to_thread(store.acquire_model_lock)
         configuration = await load_configuration(uow.configurations if uow else None)
-        return _service().index(project_id, body.path, embedding_model=configuration["embedding.model"])
+        return await asyncio.to_thread(
+            _service(store).index, project_id, body.path,
+            embedding_model=configuration["embedding.model"], model_lock_held=True,
+        )
     except ProjectBusy as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (InvalidProject, RootNotAllowed) as exc:
@@ -47,12 +53,15 @@ async def index_project(project_id: str, body: CodebaseIndexRequest, _: None = D
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (OSError, RuntimeError, ValidationError) as exc:
         raise HTTPException(status_code=502, detail="Codebase indexing failed") from exc
+    finally:
+        if model_lock is not None:
+            model_lock.release()
 
 
 @router.delete("/projects/{project_id}", status_code=204)
 async def delete_project(project_id: str, _: None = Depends(require_codebase_token)):
     try:
-        _service().delete(project_id)
+        await asyncio.to_thread(_service().delete, project_id)
     except ProjectBusy as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except InvalidProject as exc:
@@ -61,7 +70,8 @@ async def delete_project(project_id: str, _: None = Depends(require_codebase_tok
 
 @router.get("/projects", response_model=CodebaseProjectListResponse)
 async def list_projects(_: None = Depends(require_codebase_token)):
-    return {"projects": [{"project_id": project} for project in _service().projects()]}
+    projects = await asyncio.to_thread(_service().projects)
+    return {"projects": [{"project_id": project} for project in projects]}
 
 
 @router.post("/search", response_model=CodebaseSearchResponse)
@@ -69,8 +79,11 @@ async def search_codebase(body: CodebaseSearchRequest, _: None = Depends(require
                           uow: UnitOfWork | None = Depends(get_optional_uow)):
     try:
         configuration = await load_configuration(uow.configurations if uow else None)
-        return {"results": _service().search(body.project_id, body.query, body.limit,
-                                               embedding_model=configuration["embedding.model"])}
+        results = await asyncio.to_thread(
+            _service().search, body.project_id, body.query, body.limit,
+            embedding_model=configuration["embedding.model"],
+        )
+        return {"results": results}
     except InvalidProject as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (OSError, RuntimeError) as exc:

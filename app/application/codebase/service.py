@@ -5,8 +5,10 @@ class CodebaseService:
     def __init__(self, store: CodebaseIndexStore | None = None):
         self.store = store or CodebaseIndexStore()
 
-    def index(self, project_id: str, path: str, *, embedding_model: str | None = None):
-        return self.store.index(project_id, path, embedding_model=embedding_model)
+    def index(self, project_id: str, path: str, *, embedding_model: str | None = None,
+              model_lock_held: bool = False):
+        return self.store.index(project_id, path, embedding_model=embedding_model,
+                                model_lock_held=model_lock_held)
 
     def delete(self, project_id: str):
         return self.store.delete(project_id)
