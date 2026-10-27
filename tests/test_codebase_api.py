@@ -1,4 +1,5 @@
 import asyncio
+import os
 import threading
 
 import pytest
@@ -27,6 +28,7 @@ def codebase_env(tmp_path, monkeypatch):
     monkeypatch.setenv("AURORA_CODEBASE_ROOTS", str(tmp_path / "roots"))
     monkeypatch.setenv("AURORA_CODEBASE_INDEX_ROOT", str(tmp_path / "index"))
     (tmp_path / "roots").mkdir()
+    monkeypatch.setattr(index_store, "CHROMA_DIRECTORY", str(tmp_path / "chroma"))
     monkeypatch.setattr(index_store, "OllamaEmbeddings", FakeEmbeddings)
     return tmp_path
 
@@ -91,6 +93,11 @@ async def test_index_scans_safe_text_with_nested_gitignore_and_line_metadata(cod
     assert item["path"] == "src/main.py"
     assert item["start_line"] == 1 and item["end_line"] == 3
     assert "hidden.py" not in str(results.json()) and "TOKEN" not in str(results.json())
+    chroma = index_store.chromadb.PersistentClient(path=str(codebase_env / "chroma"))
+    names = [item if isinstance(item, str) else item.name for item in chroma.list_collections()]
+    documents = chroma.get_collection(names[0]).get(include=["documents"])["documents"]
+    assert any("kept" in document for document in documents)
+    assert all("dropped" not in document and "should not be indexed" not in document for document in documents)
 
 
 @pytest.mark.asyncio
@@ -117,7 +124,7 @@ async def test_reindex_removes_stale_chunks_and_failed_build_keeps_published_gen
     preserved = await codebase_client.post("/codebase/search", headers=headers,
                                            json={"project_id": "demo", "query": "new", "limit": 5})
     assert preserved.json()["results"]
-    chroma = index_store.chromadb.PersistentClient(path=str(codebase_env / "index" / "chroma"))
+    chroma = index_store.chromadb.PersistentClient(path=str(codebase_env / "chroma"))
     names = [item if isinstance(item, str) else item.name for item in chroma.list_collections()]
     assert len([name for name in names if name.startswith("aurora_codebase_")]) == 1
 
@@ -175,6 +182,34 @@ async def test_path_confinement_and_project_listing(codebase_client, codebase_en
     assert rejected.status_code in {404, 422}
     projects = await codebase_client.get("/codebase/projects", headers=headers)
     assert projects.json() == {"projects": [{"project_id": "legacy"}]}
+
+
+@pytest.mark.asyncio
+async def test_ignore_file_limits_and_special_files_fail_closed(codebase_client, codebase_env):
+    from app.infrastructure.codebase.index_store import MAX_GITIGNORE_BYTES, MAX_GITIGNORE_RULES
+
+    headers = {"Authorization": "Bearer codebase-test-token"}
+    oversized = codebase_env / "roots" / "oversized"
+    oversized.mkdir()
+    (oversized / ".gitignore").write_text("x\n" * (MAX_GITIGNORE_RULES + 1), encoding="utf-8")
+    too_many_rules = await codebase_client.post("/codebase/projects/oversized/index", headers=headers,
+                                                json={"path": str(oversized)})
+    assert too_many_rules.status_code == 422
+
+    too_large = codebase_env / "roots" / "too-large"
+    too_large.mkdir()
+    (too_large / ".gitignore").write_bytes(b"x" * (MAX_GITIGNORE_BYTES + 1))
+    too_large_response = await codebase_client.post("/codebase/projects/too-large/index", headers=headers,
+                                                    json={"path": str(too_large)})
+    assert too_large_response.status_code == 422
+
+    special = codebase_env / "roots" / "special"
+    special.mkdir()
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(special / "input.py")
+        fifo_response = await codebase_client.post("/codebase/projects/special/index", headers=headers,
+                                                   json={"path": str(special)})
+        assert fifo_response.status_code == 422
 
 
 @pytest.mark.asyncio

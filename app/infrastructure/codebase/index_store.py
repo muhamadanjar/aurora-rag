@@ -18,11 +18,14 @@ from langchain_community.embeddings import OllamaEmbeddings
 from pathspec import PathSpec
 
 from app.application.rag.config_service import DEFAULT_CONFIGURATION
+from app.infrastructure.rag.vector_store import CHROMA_DIRECTORY
 
 PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 LEGACY_PROJECT_ID = "legacy"
 DEFAULT_INDEX_ROOT = Path("./data/codebase_index")
 DEFAULT_MAX_FILE_BYTES = 1_048_576
+MAX_GITIGNORE_BYTES = 1_048_576
+MAX_GITIGNORE_RULES = 10_000
 CHUNK_LINES = 80
 CHUNK_OVERLAP = 10
 IGNORED_DIRS = {".git", ".hg", ".svn", ".idea", ".venv", "venv", "__pycache__",
@@ -60,7 +63,7 @@ class ScanError(CodebaseIndexError):
 class CodebaseIndexStore:
     def __init__(self, *, index_root: Path | None = None, max_file_bytes: int = DEFAULT_MAX_FILE_BYTES):
         self.root = Path(os.getenv("AURORA_CODEBASE_INDEX_ROOT", str(index_root or DEFAULT_INDEX_ROOT))).resolve()
-        self.chroma_root = Path(os.getenv("AURORA_CODEBASE_CHROMA_ROOT", str(self.root / "chroma"))).resolve()
+        self.chroma_root = Path(CHROMA_DIRECTORY).resolve()
         self.max_file_bytes = max_file_bytes
 
     @staticmethod
@@ -101,42 +104,31 @@ class CodebaseIndexStore:
         return [Path(os.path.abspath(os.path.expanduser(value))) for value in raw.split(os.pathsep) if value.strip()]
 
     @staticmethod
-    def _has_symlink_component(path: Path) -> bool:
-        current = Path(path.anchor)
-        for part in path.parts[1:]:
-            current /= part
-            try:
-                if stat.S_ISLNK(os.lstat(current).st_mode):
-                    return True
-            except FileNotFoundError:
-                continue
-        return False
+    def _open_directory_components(path: Path) -> int:
+        fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for part in path.parts[1:]:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+            return fd
+        except OSError:
+            os.close(fd)
+            raise
 
     def _open_confined_directory(self, requested: str) -> tuple[int, Path]:
         requested_path = Path(os.path.expanduser(requested))
         if not requested_path.is_absolute():
             raise RootNotAllowed("path is not allowed")
         candidate = Path(os.path.abspath(requested_path))
-        if self._has_symlink_component(candidate):
-            raise RootNotAllowed("path is not allowed")
-        try:
-            resolved = candidate.resolve(strict=True)
-        except OSError as exc:
-            raise RootNotAllowed("path is not allowed") from exc
         for root in self.configured_roots():
-            if self._has_symlink_component(root):
-                raise RootNotAllowed("path is not allowed")
             try:
-                root = root.resolve(strict=True)
-            except OSError:
-                continue
-            try:
-                relative = resolved.relative_to(root)
+                relative = candidate.relative_to(root)
             except ValueError:
                 continue
             fd = None
             try:
-                fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                fd = self._open_directory_components(root)
                 for part in relative.parts:
                     next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                     os.close(fd)
@@ -145,6 +137,8 @@ class CodebaseIndexStore:
             except OSError as exc:
                 if fd is not None:
                     os.close(fd)
+                if exc.errno == errno.ENOENT:
+                    continue
                 if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
                     raise RootNotAllowed("path is not allowed") from exc
                 raise ScanError("codebase path could not be opened") from exc
@@ -153,16 +147,30 @@ class CodebaseIndexStore:
     @staticmethod
     def _load_gitignore(fd: int, base: str) -> list[tuple[str, PathSpec]]:
         try:
-            ignore_fd = os.open(".gitignore", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+            ignore_fd = os.open(".gitignore", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
         except FileNotFoundError:
             return []
         except OSError as exc:
             raise ScanError("codebase ignore rules could not be read") from exc
         try:
-            with os.fdopen(ignore_fd, "r", encoding="utf-8") as handle:
-                lines = [line.rstrip("\n\r") for line in handle]
+            ignore_stat = os.fstat(ignore_fd)
+            if not stat.S_ISREG(ignore_stat.st_mode):
+                raise ScanError("codebase ignore rules are not a regular file")
+            data = bytearray()
+            while len(data) <= MAX_GITIGNORE_BYTES:
+                block = os.read(ignore_fd, min(131_072, MAX_GITIGNORE_BYTES + 1 - len(data)))
+                if not block:
+                    break
+                data.extend(block)
+            if len(data) > MAX_GITIGNORE_BYTES:
+                raise ScanError("codebase ignore rules are too large")
+            lines = bytes(data).decode("utf-8").splitlines()
         except (OSError, UnicodeDecodeError) as exc:
             raise ScanError("codebase ignore rules could not be read") from exc
+        finally:
+            os.close(ignore_fd)
+        if len(lines) > MAX_GITIGNORE_RULES:
+            raise ScanError("codebase ignore rules contain too many rules")
         return [(base, PathSpec.from_lines("gitwildmatch", [line.strip()])) for line in lines
                 if line.strip() and not line.lstrip().startswith("#")]
 
@@ -175,7 +183,7 @@ class CodebaseIndexStore:
                 for rule in pattern.patterns:
                     match = rule.match_file(candidate)
                     if match is not None:
-                        ignored = not rule.include
+                        ignored = bool(rule.include)
         return ignored
 
     @staticmethod
@@ -185,8 +193,10 @@ class CodebaseIndexStore:
 
     def _read_source(self, fd: int, relative: str) -> tuple[str | None, bool]:
         try:
-            stat = os.fstat(fd)
-            if stat.st_size > self.max_file_bytes:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ScanError("codebase source is not a regular file")
+            if file_stat.st_size > self.max_file_bytes:
                 return None, True
             data = bytearray()
             while len(data) <= self.max_file_bytes:
@@ -227,12 +237,21 @@ class CodebaseIndexStore:
                 finally:
                     os.close(child_fd)
                 continue
-            if not entry.is_file(follow_symlinks=False) or entry.name == ".gitignore" or self._ignored(child, rules):
+            if entry.name == ".gitignore" or self._ignored(child, rules):
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                try:
+                    special = (entry.is_fifo() or entry.is_socket() or entry.is_block_device()
+                               or entry.is_char_device())
+                except OSError as exc:
+                    raise ScanError("codebase directory entry could not be inspected") from exc
+                if special:
+                    raise ScanError("codebase source is not a regular file")
                 continue
             if self._is_secret(entry.name):
                 continue
             try:
-                file_fd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+                file_fd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
             except OSError as exc:
                 raise ScanError("codebase file could not be opened") from exc
             try:
