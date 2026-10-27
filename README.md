@@ -50,7 +50,7 @@ curl --fail-with-body -X POST 'http://127.0.0.1:8000/codebase/projects/my-projec
 
 Indexing is synchronous. A successful re-index publishes a new generation and removes stale source results; failures preserve the published generation. Source paths in project results are relative to the indexed directory, with line ranges. The scanner honors `.gitignore` and excludes symbolic links, known secret files, binary files, dependencies and build output. Large files are skipped and reported in the response. Filename exclusions do not detect secrets embedded in otherwise allowed source files; review a project before indexing it.
 
-Files over 1 MiB are skipped. A scan fails without publishing if it exceeds 64 MiB in aggregate, 10,000 files, or 50,000 chunks. Each `.gitignore` is limited to 1 MiB and 10,000 rules. Embeddings are inserted in batches of 128. An index or delete already in progress for a project returns `409`; reads continue against the previously published generation during a re-index.
+Files over 1 MiB are skipped. A scan fails without publishing if it exceeds 64 MiB in aggregate, 10,000 files, 50,000 chunks, 100,000 directory entries, 64 directory levels, or 60 seconds. Each `.gitignore` is limited to 1 MiB and 10,000 rules; aggregate ignore data is limited to 8 MiB and 50,000 rules. Individual ignore-pattern matches are limited to 50 ms. Embeddings are inserted in batches of 128. An index or delete already in progress for a project returns `409`; reads continue against the previously published generation during a re-index.
 
 | Method and path | Purpose |
 |---|---|
