@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import chromadb
+import regex as safe_regex
 from filelock import FileLock, Timeout
 from langchain_community.embeddings import OllamaEmbeddings
 from pathspec import PathSpec
@@ -33,12 +34,12 @@ EMBEDDING_BATCH_SIZE = 128
 MAX_SCAN_SECONDS = 60
 MAX_VISITED_ENTRIES = 100_000
 MAX_DIRECTORY_DEPTH = 64
+MAX_GITIGNORE_MATCH_SECONDS = 0.05
 MAX_GITIGNORE_BYTES = 1_048_576
 MAX_GITIGNORE_RULES = 10_000
 MAX_TOTAL_GITIGNORE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_GITIGNORE_RULES = 50_000
 MAX_GITIGNORE_PATTERN_BYTES = 4096
-MAX_GITIGNORE_WILDCARDS = 64
 CHUNK_LINES = 80
 CHUNK_OVERLAP = 10
 IGNORED_DIRS = {".git", ".hg", ".svn", ".idea", ".venv", "venv", "__pycache__",
@@ -140,24 +141,8 @@ class CodebaseIndexStore:
     def _validate_gitignore_pattern(line: str) -> None:
         if len(line.encode("utf-8")) > MAX_GITIGNORE_PATTERN_BYTES:
             raise ScanError("codebase ignore pattern is too large")
-        if line.count("*") + line.count("?") > MAX_GITIGNORE_WILDCARDS:
-            raise ScanError("codebase ignore pattern is too complex")
-        for segment in line.split("/"):
-            runs = re.findall(r"[*?]+", segment)
-            if len(runs) > 1:
-                raise ScanError("codebase ignore pattern is too complex")
-        bracket_depth = 0
-        for character in line:
-            if character == "[":
-                bracket_depth += 1
-            elif character == "]":
-                bracket_depth -= 1
-                if bracket_depth < 0:
-                    raise ScanError("codebase ignore pattern is invalid")
-        if bracket_depth:
-            raise ScanError("codebase ignore pattern is invalid")
 
-    def _open_confined_directory(self, requested: str, state: dict[str, Any]) -> tuple[int, Path, list[tuple[str, PathSpec]]]:
+    def _open_confined_directory(self, requested: str, state: dict[str, Any]) -> tuple[int, Path, list[tuple[str, PathSpec, list[Any]]]]:
         requested_path = Path(os.path.expanduser(requested))
         if not requested_path.is_absolute():
             raise RootNotAllowed("path is not allowed")
@@ -202,7 +187,7 @@ class CodebaseIndexStore:
         raise RootNotAllowed("path is not allowed")
 
     @staticmethod
-    def _load_gitignore(fd: int, base: str, state: dict[str, Any]) -> list[tuple[str, PathSpec]]:
+    def _load_gitignore(fd: int, base: str, state: dict[str, Any]) -> list[tuple[str, PathSpec, list[Any]]]:
         CodebaseIndexStore._check_scan_deadline(state)
         try:
             ignore_fd = os.open(".gitignore", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
@@ -242,28 +227,33 @@ class CodebaseIndexStore:
                 continue
             CodebaseIndexStore._validate_gitignore_pattern(stripped)
             try:
-                patterns.append((base, PathSpec.from_lines("gitwildmatch", [stripped])))
+                spec = PathSpec.from_lines("gitwildmatch", [stripped])
+                safe_patterns = [
+                    safe_regex.compile(rule.regex.pattern, rule.regex.flags)
+                    for rule in spec.patterns
+                ]
+                patterns.append((base, spec, safe_patterns))
             except Exception as exc:
                 raise ScanError("codebase ignore pattern is invalid") from exc
             CodebaseIndexStore._check_scan_deadline(state)
         return patterns
 
     @staticmethod
-    def _ignored(relative: str, rules: list[tuple[str, PathSpec]], *, is_dir: bool = False,
+    def _ignored(relative: str, rules: list[tuple[str, PathSpec, list[Any]]], *, is_dir: bool = False,
                  state: dict[str, Any] | None = None) -> bool:
         if len(relative.encode("utf-8")) > MAX_GITIGNORE_PATTERN_BYTES:
             raise ScanError("codebase path is too long for ignore matching")
         ignored = False
-        for base, pattern in rules:
+        for base, pattern, safe_patterns in rules:
             if state is not None:
                 CodebaseIndexStore._check_scan_deadline(state)
             candidate = relative if not base else relative.removeprefix(f"{base}/")
             if is_dir:
                 candidate += "/"
             if not base or relative == base or relative.startswith(f"{base}/"):
-                for rule in pattern.patterns:
+                for rule, safe_pattern in zip(pattern.patterns, safe_patterns):
                     try:
-                        match = rule.match_file(candidate)
+                        match = safe_pattern.match(candidate, timeout=MAX_GITIGNORE_MATCH_SECONDS)
                     except TimeoutError as exc:
                         raise ScanError("codebase ignore matching exceeded its deadline") from exc
                     except Exception as exc:
@@ -307,7 +297,7 @@ class CodebaseIndexStore:
         except OSError as exc:
             raise ScanError("codebase file could not be read") from exc
 
-    def _scan_directory(self, fd: int, relative: str, rules: list[tuple[str, PathSpec]],
+    def _scan_directory(self, fd: int, relative: str, rules: list[tuple[str, PathSpec, list[Any]]],
                         files: list[tuple[str, str]], skipped: list[str], stats: dict[str, int],
                         display_relative: str = "", depth: int = 0) -> None:
         self._check_scan_deadline(stats)
@@ -381,7 +371,7 @@ class CodebaseIndexStore:
             if text is not None and (Path(entry.name).suffix.lower() in TEXT_SUFFIXES or "." not in entry.name):
                 files.append((display_child, text))
 
-    def _chunks(self, fd: int, relative: Path, rules: list[tuple[str, PathSpec]],
+    def _chunks(self, fd: int, relative: Path, rules: list[tuple[str, PathSpec, list[Any]]],
                 stats: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
         files: list[tuple[str, str]] = []
         skipped: list[str] = []

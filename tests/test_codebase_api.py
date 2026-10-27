@@ -421,6 +421,24 @@ async def test_scan_pattern_deadline_and_enumeration_budgets_fail_closed(codebas
 
 
 @pytest.mark.asyncio
+async def test_gitignore_regex_timeout_fails_as_scan_error(codebase_client, codebase_env, monkeypatch):
+    root = codebase_env / "roots" / "regex-timeout"
+    root.mkdir()
+    (root / ".gitignore").write_text("**/*.py\n", encoding="utf-8")
+    (root / "main.py").write_text("timeout", encoding="utf-8")
+
+    class TimedOutPattern:
+        def match(self, value, *, timeout):
+            raise TimeoutError
+
+    monkeypatch.setattr(index_store.safe_regex, "compile", lambda *args: TimedOutPattern())
+    response = await codebase_client.post("/codebase/projects/regex-timeout/index",
+                                          headers={"Authorization": "Bearer codebase-test-token"},
+                                          json={"path": str(root)})
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_model_lock_can_be_released_by_event_loop_after_thread_acquire(codebase_env):
     store = CodebaseIndexStore()
     first = await asyncio.to_thread(store.acquire_model_lock)
