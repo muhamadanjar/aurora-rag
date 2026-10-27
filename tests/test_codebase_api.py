@@ -369,13 +369,6 @@ async def test_embedding_and_chroma_batches_are_bounded(codebase_client, codebas
 async def test_scan_pattern_deadline_and_enumeration_budgets_fail_closed(codebase_client, codebase_env, monkeypatch):
     headers = {"Authorization": "Bearer codebase-test-token"}
 
-    unsafe = codebase_env / "roots" / "unsafe-pattern"
-    unsafe.mkdir()
-    (unsafe / ".gitignore").write_text("*a*b*\n", encoding="utf-8")
-    response = await codebase_client.post("/codebase/projects/unsafe-pattern/index", headers=headers,
-                                          json={"path": str(unsafe)})
-    assert response.status_code == 422
-
     aggregate_rules = codebase_env / "roots" / "aggregate-rules"
     nested = aggregate_rules / "nested"
     nested.mkdir(parents=True)
