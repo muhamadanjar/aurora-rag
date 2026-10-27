@@ -385,8 +385,17 @@ class CodebaseIndexStore:
                 model_lock = self.acquire_model_lock()
             lock = self._acquire(project_id)
             fd, _ = self._open_confined_directory(requested_path)
-            current = self._published(project_id)
-            self._cleanup_project_collections(project_id, keep=current.get("collection_name") if current else None)
+            initial_publication_fd = self._open_flock(self._publication_lock_path(project_id))
+            try:
+                fcntl.flock(initial_publication_fd, fcntl.LOCK_EX)
+                current = self._published(project_id)
+                self._cleanup_project_collections(
+                    project_id,
+                    keep=current.get("collection_name") if current else None,
+                    include_unpublished=True,
+                )
+            finally:
+                self._release_flock(initial_publication_fd)
             chunks, skipped = self._chunks(fd)
             model = embedding_model or self._embedding_model()
             generation = secrets.token_hex(16)
@@ -418,13 +427,24 @@ class CodebaseIndexStore:
                 fcntl.flock(publication_fd, fcntl.LOCK_EX)
                 os.replace(temporary, self._metadata_path(project_id))
                 published = True
-                os.replace(generation_temp, self._generation_path(project_id, generation))
                 try:
-                    self._cleanup_project_collections(project_id, keep=collection_name)
+                    os.replace(generation_temp, self._generation_path(project_id, generation))
+                except OSError:
+                    # The pointer is already the publication boundary. A later
+                    # operation can reap this unmarked generation safely.
+                    pass
+                try:
+                    self._cleanup_project_collections(
+                        project_id, keep=collection_name, include_unpublished=True
+                    )
                 except Exception:
                     pass
             finally:
-                self._release_flock(publication_fd)
+                try:
+                    self._release_flock(publication_fd)
+                except OSError:
+                    if not published:
+                        raise
             return {"project_id": project_id, "indexed_chunks": len(chunks),
                     "skipped_files": len(skipped), "skipped_paths": skipped}
         except Exception:
@@ -513,10 +533,15 @@ class CodebaseIndexStore:
             if reader_fd is not None:
                 self._release_flock(reader_fd)
             try:
-                current = self._published(project_id)
-                self._cleanup_project_collections(
-                    project_id, keep=current.get("collection_name") if current else None
-                )
+                cleanup_publication_fd = self._open_flock(self._publication_lock_path(project_id))
+                try:
+                    fcntl.flock(cleanup_publication_fd, fcntl.LOCK_EX)
+                    current = self._published(project_id)
+                    self._cleanup_project_collections(
+                        project_id, keep=current.get("collection_name") if current else None
+                    )
+                finally:
+                    self._release_flock(cleanup_publication_fd)
             except Exception:
                 pass
 

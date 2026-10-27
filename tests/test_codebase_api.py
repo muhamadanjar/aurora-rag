@@ -199,6 +199,44 @@ async def test_search_reads_old_generation_during_paused_reindex_then_new_genera
     assert any("new generation" in item["content"] for item in new_search.json()["results"])
 
 
+@pytest.mark.asyncio
+async def test_search_cleanup_and_publish_are_serialized(codebase_client, codebase_env, monkeypatch):
+    root = codebase_env / "roots" / "publication-race"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("old snapshot", encoding="utf-8")
+    headers = {"Authorization": "Bearer codebase-test-token"}
+    initial = await codebase_client.post("/codebase/projects/publication-race/index", headers=headers,
+                                         json={"path": str(root)})
+    assert initial.status_code == 200
+    source.write_text("new snapshot", encoding="utf-8")
+
+    cleanup_entered = threading.Event()
+    release_cleanup = threading.Event()
+    original_cleanup = index_store.CodebaseIndexStore._cleanup_project_collections
+
+    def pause_search_cleanup(self, project_id, *, keep=None, include_unpublished=False):
+        if not include_unpublished and not cleanup_entered.is_set():
+            cleanup_entered.set()
+            release_cleanup.wait(timeout=2)
+        return original_cleanup(self, project_id, keep=keep, include_unpublished=include_unpublished)
+
+    monkeypatch.setattr(index_store.CodebaseIndexStore, "_cleanup_project_collections", pause_search_cleanup)
+    search = asyncio.create_task(codebase_client.post("/codebase/search", headers=headers,
+                                                      json={"project_id": "publication-race", "query": "old", "limit": 5}))
+    assert await asyncio.to_thread(cleanup_entered.wait, 1)
+    reindex = asyncio.create_task(codebase_client.post("/codebase/projects/publication-race/index", headers=headers,
+                                                       json={"path": str(root)}))
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(reindex), timeout=0.05)
+    release_cleanup.set()
+    assert (await search).status_code == 200
+    assert (await reindex).status_code == 200
+    current = await codebase_client.post("/codebase/search", headers=headers,
+                                         json={"project_id": "publication-race", "query": "new", "limit": 5})
+    assert any("new snapshot" in item["content"] for item in current.json()["results"])
+
+
 def test_same_project_operations_are_rejected_across_workers(codebase_env):
     store = CodebaseIndexStore()
     lock = store._acquire("demo")
