@@ -2,9 +2,10 @@ import asyncio
 import pytest
 import bcrypt
 
-from dataset_management import service
-from dataset_management.models import DatasetExport, DatasetStatus, RevisionState, ReviewState, TrainingDataset, TrainingExampleRevision
-from dataset_management.settings import Settings
+from app.application.dataset import export_service as service
+from app.domain.dataset.entities import Dataset, DatasetStatus
+from app.infrastructure.db.models import DatasetExport, RevisionState, ReviewState, TrainingExampleRevision
+from app.core.config import Settings
 from uuid import uuid4
 
 
@@ -57,11 +58,29 @@ class FakeSession:
         self.rolled_back = True
 
 
+def _dataset(title: str) -> Dataset:
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    actor = uuid4()
+    return Dataset(
+        id=uuid4(),
+        title=title,
+        description=None,
+        format_type="chatml",
+        version=1,
+        status=DatasetStatus.active,
+        created_by=actor,
+        updated_by=actor,
+        created_at=now,
+        updated_at=now,
+    )
+
+
 @pytest.mark.asyncio
 async def test_export_failure_cleanup_contract(monkeypatch, tmp_path):
     monkeypatch.setattr(service.os, "replace", lambda *_: (_ for _ in ()).throw(OSError("publish failed")))
     revision = TrainingExampleRevision(example_id=uuid4(), revision_number=1, version=1, content=[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}], validation_status=RevisionState.valid, review_status=ReviewState.approved, created_by=uuid4())
-    dataset = TrainingDataset(title="failure", created_by=uuid4(), updated_by=uuid4(), status=DatasetStatus.active)
+    dataset = _dataset("failure")
     session = FakeSession(revision, dataset)
     settings = Settings(database_url="postgresql+asyncpg://db", auth_username="operator", auth_password_hash=bcrypt.hashpw(b"secret", bcrypt.gensalt()).decode(), jwt_secret="x" * 32, operator_uuid=uuid4(), export_root=tmp_path)
     with pytest.raises(OSError):
@@ -77,7 +96,7 @@ async def test_export_failure_cleanup_contract(monkeypatch, tmp_path):
 async def test_export_cancellation_persists_failed_metadata(monkeypatch, tmp_path):
     monkeypatch.setattr(service.os, "replace", lambda *_: (_ for _ in ()).throw(asyncio.CancelledError()))
     revision = TrainingExampleRevision(example_id=uuid4(), revision_number=1, version=1, content=[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}], validation_status=RevisionState.valid, review_status=ReviewState.approved, created_by=uuid4())
-    dataset = TrainingDataset(title="cancel", created_by=uuid4(), updated_by=uuid4(), status=DatasetStatus.active)
+    dataset = _dataset("cancel")
     session = FakeSession(revision, dataset)
     settings = Settings(database_url="postgresql+asyncpg://db", auth_username="operator", auth_password_hash=bcrypt.hashpw(b"secret", bcrypt.gensalt()).decode(), jwt_secret="x" * 32, operator_uuid=uuid4(), export_root=tmp_path)
     with pytest.raises(asyncio.CancelledError):
@@ -87,7 +106,7 @@ async def test_export_cancellation_persists_failed_metadata(monkeypatch, tmp_pat
 @pytest.mark.asyncio
 async def test_export_root_failure_persists_failed_metadata(tmp_path):
     revision = TrainingExampleRevision(example_id=uuid4(), revision_number=1, version=1, content=[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}], validation_status=RevisionState.valid, review_status=ReviewState.approved, created_by=uuid4())
-    dataset = TrainingDataset(title="unwritable", created_by=uuid4(), updated_by=uuid4(), status=DatasetStatus.active)
+    dataset = _dataset("unwritable")
     root_is_file = tmp_path / "not-a-directory"
     root_is_file.write_text("blocking directory creation")
     session = FakeSession(revision, dataset)

@@ -1,5 +1,20 @@
 # Aurora RAG
 
+## Architecture
+
+The codebase follows a layered Clean Architecture. Dependencies point inward; the delivery layer talks to application services, application services depend on domain ports, and infrastructure implements those ports.
+
+```
+app/core/        # framework-agnostic settings and shared errors
+app/domain/      # entities, value objects, repository ports, ChatML rules
+app/application/ # use cases: dataset, export, RAG chat, runtime config, auth
+app/infrastructure/ # SQLAlchemy repositories/unit of work, file storage, Chroma/Ollama, security
+app/delivery/    # FastAPI routers, request/response schemas, auth dependencies, middleware
+app/main.py      # composition root: wires routers and exception handlers
+```
+
+Each request opens one `UnitOfWork` (`app.delivery.dependencies.get_uow`). Repositories only flush; application services decide when to commit, so multi-step mutations stay atomic. HTTP concerns such as ETags and status codes remain in the delivery layer.
+
 ## Runtime chat and configuration
 
 `POST /api/v1/chat/completions` uses Chroma retrieval and Ollama. Send `messages` with only `user` and `assistant` roles; the last message must be from `user`. The server owns the RAG prompt and model selection. An optional request `model` must match the configured `chat.model`. `stream` defaults to `true` and returns SSE; `false` returns a Chat Completions JSON response. Chat and configuration routes require a Bearer token from `POST /auth/token`.
@@ -31,8 +46,16 @@ python -c 'import bcrypt, getpass; print(bcrypt.hashpw(getpass.getpass("Password
 ```bash
 cp .env.example .env
 alembic upgrade head
-uvicorn main:app --reload
+uvicorn app.main:app --reload
 ```
+
+Create migrations with the Alembic hook; new revisions are numbered sequentially (`0003`, `0004`, ...):
+
+```bash
+alembic revision --autogenerate -m "describe change"
+```
+
+Migration files use the `NNNN_slug.py` format. Do not manually use timestamp-based revision IDs.
 
 Install development-only test dependencies with `pip install -r requirements-dev.txt`.
 

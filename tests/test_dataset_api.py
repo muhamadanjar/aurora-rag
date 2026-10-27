@@ -19,12 +19,12 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from dataset_management import db
-from dataset_management.auth import clear_failed_logins
-from dataset_management.models import DatasetExport, ExportStatus, now
-from dataset_management.service import cleanup_expired_exports, cleanup_orphaned_export_files, reconcile_stale_exports
-from dataset_management.settings import get_settings
-from main import app
+from app.infrastructure.db import connection as db
+from app.application.auth.service import clear_failed_logins
+from app.infrastructure.db.models import DatasetExport, ExportStatus, now
+from app.application.dataset.export_service import cleanup_expired_exports, cleanup_orphaned_export_files, reconcile_stale_exports
+from app.core.config import get_settings
+from app.main import app
 
 
 @pytest.fixture
@@ -437,7 +437,7 @@ async def test_configuration_api_rejects_unknown_keys_and_invalid_retrieval_k(cl
 
 @pytest.mark.asyncio
 async def test_embedding_model_cannot_change_after_vectors_exist(client, monkeypatch):
-    from dataset_management import runtime_routes
+    from app.delivery.routers import runtime_router as runtime_routes
 
     headers = await login(client)
     monkeypatch.setattr(runtime_routes, "indexed_vector_count", lambda: 1)
@@ -452,7 +452,7 @@ async def test_embedding_model_cannot_change_after_vectors_exist(client, monkeyp
 async def test_chat_completions_returns_rag_answer_in_json_and_sse(client, monkeypatch):
     from langchain_core.documents import Document
 
-    from dataset_management import runtime_routes
+    from app.delivery.routers import runtime_router as runtime_routes
 
     class EvidenceStore:
         def similarity_search(self, query, *, k):
@@ -528,7 +528,7 @@ async def test_chat_completions_returns_rag_answer_in_json_and_sse(client, monke
 
 @pytest.mark.asyncio
 async def test_embedding_model_can_change_before_ingestion(client, monkeypatch):
-    from dataset_management import runtime_routes
+    from app.delivery.routers import runtime_router as runtime_routes
 
     headers = await login(client)
     monkeypatch.setattr(runtime_routes, "indexed_vector_count", lambda: 0)
@@ -543,7 +543,7 @@ async def test_embedding_model_can_change_before_ingestion(client, monkeypatch):
     assert values["embedding.model"] == "alternate-embedding"
 @pytest.mark.asyncio
 async def test_legacy_query_uses_runtime_configuration_without_changing_response(client, monkeypatch):
-    import main
+    from app.delivery.routers import rag_router
     from langchain_core.documents import Document
 
     class EvidenceStore:
@@ -561,8 +561,8 @@ async def test_legacy_query_uses_runtime_configuration_without_changing_response
         async def ainvoke(self, prompt):
             return "42" if "The answer is 42." in prompt else "unknown"
 
-    monkeypatch.setattr(main, "create_vector_store", lambda _: EvidenceStore())
-    monkeypatch.setattr(main, "create_chat_model", lambda _: EvidenceModel())
+    monkeypatch.setattr(rag_router, "create_vector_store", lambda _: EvidenceStore())
+    monkeypatch.setattr(rag_router, "create_chat_model", lambda _: EvidenceModel())
     headers = await login(client)
     updated = await client.put(
         "/api/v1/configuration/retrieval.k",
@@ -578,7 +578,7 @@ async def test_legacy_query_uses_runtime_configuration_without_changing_response
 
 @pytest.mark.asyncio
 async def test_chat_generation_errors_do_not_leak_upstream_details(client, monkeypatch):
-    from dataset_management import runtime_routes
+    from app.delivery.routers import runtime_router as runtime_routes
 
     class EmptyStore:
         def similarity_search(self, question, *, k):
@@ -638,11 +638,11 @@ async def test_chat_request_limits_and_generation_overrides_are_rejected(client)
 
 @pytest.mark.asyncio
 async def test_chat_http_body_limit_rejects_oversized_unauthenticated_body(client):
-    import main
+    from app.delivery.middleware import MAX_CHAT_REQUEST_BODY_BYTES
 
     async def chunks():
-        yield b"x" * (main.MAX_CHAT_REQUEST_BODY_BYTES // 2)
-        yield b"x" * (main.MAX_CHAT_REQUEST_BODY_BYTES // 2 + 1)
+        yield b"x" * (MAX_CHAT_REQUEST_BODY_BYTES // 2)
+        yield b"x" * (MAX_CHAT_REQUEST_BODY_BYTES // 2 + 1)
 
     response = await client.post(
         "/api/v1/chat/completions",
