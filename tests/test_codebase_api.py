@@ -266,6 +266,25 @@ async def test_path_confinement_and_project_listing(codebase_client, codebase_en
 
 
 @pytest.mark.asyncio
+async def test_direct_hard_excluded_and_ignored_ancestor_paths_are_rejected(codebase_client, codebase_env, monkeypatch):
+    headers = {"Authorization": "Bearer codebase-test-token"}
+    monkeypatch.setattr(index_store, "IGNORED_DIRS", set(index_store.IGNORED_DIRS) | {"secrets"})
+    secrets = codebase_env / "roots" / "repo" / "Secrets"
+    secrets.mkdir(parents=True)
+    direct = await codebase_client.post("/codebase/projects/direct-secrets/index", headers=headers,
+                                        json={"path": str(secrets)})
+    assert direct.status_code == 422
+
+    ignored_root = codebase_env / "roots" / "ignored-ancestor"
+    ignored = ignored_root / "private"
+    ignored.mkdir(parents=True)
+    (ignored_root / ".gitignore").write_text("private/\n", encoding="utf-8")
+    ancestor = await codebase_client.post("/codebase/projects/ignored-ancestor/index", headers=headers,
+                                          json={"path": str(ignored)})
+    assert ancestor.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_ignore_file_limits_and_special_files_fail_closed(codebase_client, codebase_env):
     from app.infrastructure.codebase.index_store import MAX_GITIGNORE_BYTES, MAX_GITIGNORE_RULES
 
@@ -291,6 +310,58 @@ async def test_ignore_file_limits_and_special_files_fail_closed(codebase_client,
         fifo_response = await codebase_client.post("/codebase/projects/special/index", headers=headers,
                                                    json={"path": str(special)})
         assert fifo_response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_aggregate_limits_fail_and_preserve_previous_generation(codebase_client, codebase_env, monkeypatch):
+    root = codebase_env / "roots" / "limits"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("previous", encoding="utf-8")
+    headers = {"Authorization": "Bearer codebase-test-token"}
+    assert (await codebase_client.post("/codebase/projects/limits/index", headers=headers,
+                                       json={"path": str(root)})).status_code == 200
+
+    monkeypatch.setattr(index_store, "MAX_REPOSITORY_BYTES", 1)
+    source.write_text("replacement", encoding="utf-8")
+    limited = await codebase_client.post("/codebase/projects/limits/index", headers=headers,
+                                         json={"path": str(root)})
+    assert limited.status_code == 422
+    preserved = await codebase_client.post("/codebase/search", headers=headers,
+                                           json={"project_id": "limits", "query": "previous", "limit": 5})
+    assert any("previous" in item["content"] for item in preserved.json()["results"])
+
+    monkeypatch.setattr(index_store, "MAX_REPOSITORY_BYTES", 64 * 1024 * 1024)
+    monkeypatch.setattr(index_store, "MAX_REPOSITORY_FILES", 0)
+    file_limited = await codebase_client.post("/codebase/projects/limits/index", headers=headers,
+                                              json={"path": str(root)})
+    assert file_limited.status_code == 422
+    monkeypatch.setattr(index_store, "MAX_REPOSITORY_FILES", 10_000)
+    monkeypatch.setattr(index_store, "MAX_REPOSITORY_CHUNKS", 0)
+    chunk_limited = await codebase_client.post("/codebase/projects/limits/index", headers=headers,
+                                               json={"path": str(root)})
+    assert chunk_limited.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_embedding_and_chroma_batches_are_bounded(codebase_client, codebase_env, monkeypatch):
+    root = codebase_env / "roots" / "batching"
+    root.mkdir()
+    for number in range(130):
+        (root / f"file-{number}.py").write_text(f"file {number}", encoding="utf-8")
+    batches = []
+    original = index_store.OllamaEmbeddings.embed_documents
+
+    def record_batch(self, texts):
+        batches.append(len(texts))
+        return original(self, texts)
+
+    monkeypatch.setattr(index_store.OllamaEmbeddings, "embed_documents", record_batch)
+    response = await codebase_client.post("/codebase/projects/batching/index",
+                                         headers={"Authorization": "Bearer codebase-test-token"},
+                                         json={"path": str(root)})
+    assert response.status_code == 200
+    assert batches == [128, 2]
 
 
 @pytest.mark.asyncio

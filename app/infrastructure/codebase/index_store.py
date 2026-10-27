@@ -25,6 +25,10 @@ PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 LEGACY_PROJECT_ID = "legacy"
 DEFAULT_INDEX_ROOT = Path("./data/codebase_index")
 DEFAULT_MAX_FILE_BYTES = 1_048_576
+MAX_REPOSITORY_BYTES = 64 * 1024 * 1024
+MAX_REPOSITORY_FILES = 10_000
+MAX_REPOSITORY_CHUNKS = 50_000
+EMBEDDING_BATCH_SIZE = 128
 MAX_GITIGNORE_BYTES = 1_048_576
 MAX_GITIGNORE_RULES = 10_000
 CHUNK_LINES = 80
@@ -119,7 +123,7 @@ class CodebaseIndexStore:
             os.close(fd)
             raise
 
-    def _open_confined_directory(self, requested: str) -> tuple[int, Path]:
+    def _open_confined_directory(self, requested: str) -> tuple[int, Path, list[tuple[str, PathSpec]]]:
         requested_path = Path(os.path.expanduser(requested))
         if not requested_path.is_absolute():
             raise RootNotAllowed("path is not allowed")
@@ -132,11 +136,24 @@ class CodebaseIndexStore:
             fd = None
             try:
                 fd = self._open_directory_components(root)
+                rules = self._load_gitignore(fd, "")
+                traversed = ""
                 for part in relative.parts:
+                    child = f"{traversed}/{part}" if traversed else part
+                    if self._is_hard_excluded_directory(part) or self._ignored(child, rules, is_dir=True):
+                        os.close(fd)
+                        fd = None
+                        raise RootNotAllowed("path is not allowed")
                     next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                     os.close(fd)
                     fd = next_fd
-                return fd, relative
+                    traversed = child
+                    rules = rules + self._load_gitignore(fd, traversed)
+                return fd, relative, rules
+            except CodebaseIndexError:
+                if fd is not None:
+                    os.close(fd)
+                raise
             except OSError as exc:
                 if fd is not None:
                     os.close(fd)
@@ -196,13 +213,17 @@ class CodebaseIndexStore:
         lower = name.lower()
         return lower in SECRET_NAMES or lower.startswith(".env") or lower.endswith(SECRET_SUFFIXES)
 
-    def _read_source(self, fd: int, relative: str) -> tuple[str | None, bool]:
+    @staticmethod
+    def _is_hard_excluded_directory(name: str) -> bool:
+        return name.casefold() in {value.casefold() for value in IGNORED_DIRS}
+
+    def _read_source(self, fd: int, relative: str) -> tuple[str | None, bool, int]:
         try:
             file_stat = os.fstat(fd)
             if not stat.S_ISREG(file_stat.st_mode):
                 raise ScanError("codebase source is not a regular file")
             if file_stat.st_size > self.max_file_bytes:
-                return None, True
+                return None, True, file_stat.st_size
             data = bytearray()
             while len(data) <= self.max_file_bytes:
                 block = os.read(fd, min(131_072, self.max_file_bytes + 1 - len(data)))
@@ -210,35 +231,37 @@ class CodebaseIndexStore:
                     break
                 data.extend(block)
             if len(data) > self.max_file_bytes:
-                return None, True
+                return None, True, file_stat.st_size
             if b"\x00" in data:
-                return None, False
-            return bytes(data).decode("utf-8"), False
+                return None, False, file_stat.st_size
+            return bytes(data).decode("utf-8"), False, file_stat.st_size
         except UnicodeDecodeError:
-            return None, False
+            return None, False, file_stat.st_size
         except OSError as exc:
             raise ScanError("codebase file could not be read") from exc
 
     def _scan_directory(self, fd: int, relative: str, rules: list[tuple[str, PathSpec]],
-                        files: list[tuple[str, str]], skipped: list[str]) -> None:
-        rules = rules + self._load_gitignore(fd, relative)
+                        files: list[tuple[str, str]], skipped: list[str], stats: dict[str, int],
+                        display_relative: str = "") -> None:
         try:
             entries = sorted(os.scandir(fd), key=lambda entry: entry.name)
         except OSError as exc:
             raise ScanError("codebase directory could not be read") from exc
         for entry in entries:
             child = f"{relative}/{entry.name}" if relative else entry.name
+            display_child = f"{display_relative}/{entry.name}" if display_relative else entry.name
             if entry.is_symlink():
                 continue
             if entry.is_dir(follow_symlinks=False):
-                if entry.name.lower() in IGNORED_DIRS or self._ignored(child, rules, is_dir=True):
+                if self._is_hard_excluded_directory(entry.name) or self._ignored(child, rules, is_dir=True):
                     continue
                 try:
                     child_fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                 except OSError as exc:
                     raise ScanError("codebase directory could not be opened") from exc
                 try:
-                    self._scan_directory(child_fd, child, rules, files, skipped)
+                    child_rules = rules + self._load_gitignore(child_fd, child)
+                    self._scan_directory(child_fd, child, child_rules, files, skipped, stats, display_child)
                 finally:
                     os.close(child_fd)
                 continue
@@ -260,19 +283,27 @@ class CodebaseIndexStore:
             except OSError as exc:
                 raise ScanError("codebase file could not be opened") from exc
             try:
-                text, was_skipped = self._read_source(file_fd, child)
+                text, was_skipped, byte_count = self._read_source(file_fd, child)
             finally:
                 os.close(file_fd)
+            stats["files"] += 1
+            stats["bytes"] += byte_count
+            if stats["files"] > MAX_REPOSITORY_FILES:
+                raise ScanError("repository contains too many files")
+            if stats["bytes"] > MAX_REPOSITORY_BYTES:
+                raise ScanError("repository contains too many bytes")
             if was_skipped:
-                skipped.append(child)
+                skipped.append(display_child)
             if text is not None and (Path(entry.name).suffix.lower() in TEXT_SUFFIXES or "." not in entry.name):
-                files.append((child, text))
+                files.append((display_child, text))
 
-    def _chunks(self, fd: int) -> tuple[list[dict[str, Any]], list[str]]:
+    def _chunks(self, fd: int, relative: Path, rules: list[tuple[str, PathSpec]]) -> tuple[list[dict[str, Any]], list[str]]:
         files: list[tuple[str, str]] = []
         skipped: list[str] = []
+        stats = {"files": 0, "bytes": 0}
         try:
-            self._scan_directory(fd, "", [], files, skipped)
+            rule_relative = relative.as_posix() if relative.as_posix() != "." else ""
+            self._scan_directory(fd, rule_relative, rules, files, skipped, stats)
         finally:
             os.close(fd)
         chunks = []
@@ -284,6 +315,8 @@ class CodebaseIndexStore:
                     break
                 chunks.append({"content": "\n".join(body), "path": path,
                                "start_line": start + 1, "end_line": start + len(body)})
+                if len(chunks) > MAX_REPOSITORY_CHUNKS:
+                    raise ScanError("repository contains too many chunks")
                 if start + CHUNK_LINES >= len(lines):
                     break
         return chunks, skipped
@@ -380,11 +413,12 @@ class CodebaseIndexStore:
         collection_name = None
         generation = None
         published = False
+        fd = None
         try:
             if not model_lock_held:
                 model_lock = self.acquire_model_lock()
             lock = self._acquire(project_id)
-            fd, _ = self._open_confined_directory(requested_path)
+            fd, relative, inherited_rules = self._open_confined_directory(requested_path)
             initial_publication_fd = self._open_flock(self._publication_lock_path(project_id))
             try:
                 fcntl.flock(initial_publication_fd, fcntl.LOCK_EX)
@@ -396,7 +430,9 @@ class CodebaseIndexStore:
                 )
             finally:
                 self._release_flock(initial_publication_fd)
-            chunks, skipped = self._chunks(fd)
+            scan_fd = fd
+            fd = None
+            chunks, skipped = self._chunks(scan_fd, relative, inherited_rules)
             model = embedding_model or self._embedding_model()
             generation = secrets.token_hex(16)
             collection_name = self._collection_name(project_id, generation)
@@ -407,13 +443,16 @@ class CodebaseIndexStore:
                           "generation": generation, "embedding_model": model},
             )
             if chunks:
-                vectors = OllamaEmbeddings(model=model).embed_documents([item["content"] for item in chunks])
-                collection.add(
-                    ids=[f"{generation}:{index}" for index in range(len(chunks))],
-                    embeddings=vectors,
-                    documents=[item["content"] for item in chunks],
-                    metadatas=[{key: value for key, value in item.items() if key != "content"} for item in chunks],
-                )
+                embeddings = OllamaEmbeddings(model=model)
+                for start in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
+                    batch = chunks[start:start + EMBEDDING_BATCH_SIZE]
+                    vectors = embeddings.embed_documents([item["content"] for item in batch])
+                    collection.add(
+                        ids=[f"{generation}:{index}" for index in range(start, start + len(batch))],
+                        embeddings=vectors,
+                        documents=[item["content"] for item in batch],
+                        metadatas=[{key: value for key, value in item.items() if key != "content"} for item in batch],
+                    )
             directory = self._project_dir(project_id)
             directory.mkdir(parents=True, exist_ok=True)
             metadata = {"project_id": project_id, "generation": generation,
@@ -464,6 +503,8 @@ class CodebaseIndexStore:
                     pass
             raise
         finally:
+            if fd is not None:
+                os.close(fd)
             if model_lock is not None:
                 model_lock.release()
             if lock is not None:
