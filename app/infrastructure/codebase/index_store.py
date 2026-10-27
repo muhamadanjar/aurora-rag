@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import stat
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,15 +30,22 @@ MAX_REPOSITORY_BYTES = 64 * 1024 * 1024
 MAX_REPOSITORY_FILES = 10_000
 MAX_REPOSITORY_CHUNKS = 50_000
 EMBEDDING_BATCH_SIZE = 128
+MAX_SCAN_SECONDS = 60
+MAX_VISITED_ENTRIES = 100_000
+MAX_DIRECTORY_DEPTH = 64
 MAX_GITIGNORE_BYTES = 1_048_576
 MAX_GITIGNORE_RULES = 10_000
+MAX_TOTAL_GITIGNORE_BYTES = 8 * 1024 * 1024
+MAX_TOTAL_GITIGNORE_RULES = 50_000
+MAX_GITIGNORE_PATTERN_BYTES = 4096
+MAX_GITIGNORE_WILDCARDS = 64
 CHUNK_LINES = 80
 CHUNK_OVERLAP = 10
 IGNORED_DIRS = {".git", ".hg", ".svn", ".idea", ".venv", "venv", "__pycache__",
                 "node_modules", "vendor", "dist", "build", "target", ".tox",
                 ".ssh", ".aws", "secrets", "credentials"}
 SECRET_NAMES = {".env", ".npmrc", ".pypirc", "credentials", "credentials.json",
-                "secrets", "secrets.json", "id_rsa", "id_dsa", "id_ed25519"}
+                "secrets", "secrets.json", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
 SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".secret", ".crt", ".der", ".tfstate")
 TEXT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go", ".rs",
                  ".c", ".h", ".cpp", ".hpp", ".cs", ".php", ".rb", ".swift", ".scala",
@@ -123,7 +131,33 @@ class CodebaseIndexStore:
             os.close(fd)
             raise
 
-    def _open_confined_directory(self, requested: str) -> tuple[int, Path, list[tuple[str, PathSpec]]]:
+    @staticmethod
+    def _check_scan_deadline(state: dict[str, Any]) -> None:
+        if time.monotonic() >= state["deadline"]:
+            raise ScanError("codebase scan exceeded its deadline")
+
+    @staticmethod
+    def _validate_gitignore_pattern(line: str) -> None:
+        if len(line.encode("utf-8")) > MAX_GITIGNORE_PATTERN_BYTES:
+            raise ScanError("codebase ignore pattern is too large")
+        if line.count("*") + line.count("?") > MAX_GITIGNORE_WILDCARDS:
+            raise ScanError("codebase ignore pattern is too complex")
+        for segment in line.split("/"):
+            runs = re.findall(r"[*?]+", segment)
+            if len(runs) > 1:
+                raise ScanError("codebase ignore pattern is too complex")
+        bracket_depth = 0
+        for character in line:
+            if character == "[":
+                bracket_depth += 1
+            elif character == "]":
+                bracket_depth -= 1
+                if bracket_depth < 0:
+                    raise ScanError("codebase ignore pattern is invalid")
+        if bracket_depth:
+            raise ScanError("codebase ignore pattern is invalid")
+
+    def _open_confined_directory(self, requested: str, state: dict[str, Any]) -> tuple[int, Path, list[tuple[str, PathSpec]]]:
         requested_path = Path(os.path.expanduser(requested))
         if not requested_path.is_absolute():
             raise RootNotAllowed("path is not allowed")
@@ -135,12 +169,15 @@ class CodebaseIndexStore:
                 continue
             fd = None
             try:
+                self._check_scan_deadline(state)
+                if len(relative.parts) > MAX_DIRECTORY_DEPTH:
+                    raise ScanError("codebase directory depth is too large")
                 fd = self._open_directory_components(root)
-                rules = self._load_gitignore(fd, "")
+                rules = self._load_gitignore(fd, "", state)
                 traversed = ""
                 for part in relative.parts:
                     child = f"{traversed}/{part}" if traversed else part
-                    if self._is_hard_excluded_directory(part) or self._ignored(child, rules, is_dir=True):
+                    if self._is_hard_excluded_directory(part) or self._ignored(child, rules, is_dir=True, state=state):
                         os.close(fd)
                         fd = None
                         raise RootNotAllowed("path is not allowed")
@@ -148,7 +185,7 @@ class CodebaseIndexStore:
                     os.close(fd)
                     fd = next_fd
                     traversed = child
-                    rules = rules + self._load_gitignore(fd, traversed)
+                    rules = rules + self._load_gitignore(fd, traversed, state)
                 return fd, relative, rules
             except CodebaseIndexError:
                 if fd is not None:
@@ -165,7 +202,8 @@ class CodebaseIndexStore:
         raise RootNotAllowed("path is not allowed")
 
     @staticmethod
-    def _load_gitignore(fd: int, base: str) -> list[tuple[str, PathSpec]]:
+    def _load_gitignore(fd: int, base: str, state: dict[str, Any]) -> list[tuple[str, PathSpec]]:
+        CodebaseIndexStore._check_scan_deadline(state)
         try:
             ignore_fd = os.open(".gitignore", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
         except FileNotFoundError:
@@ -178,6 +216,7 @@ class CodebaseIndexStore:
                 raise ScanError("codebase ignore rules are not a regular file")
             data = bytearray()
             while len(data) <= MAX_GITIGNORE_BYTES:
+                CodebaseIndexStore._check_scan_deadline(state)
                 block = os.read(ignore_fd, min(131_072, MAX_GITIGNORE_BYTES + 1 - len(data)))
                 if not block:
                     break
@@ -189,23 +228,50 @@ class CodebaseIndexStore:
             raise ScanError("codebase ignore rules could not be read") from exc
         finally:
             os.close(ignore_fd)
-        if len(lines) > MAX_GITIGNORE_RULES:
+        state["gitignore_bytes"] += len(data)
+        state["gitignore_rules"] += sum(bool(line.strip()) and not line.lstrip().startswith("#") for line in lines)
+        if len(lines) > MAX_GITIGNORE_RULES or state["gitignore_rules"] > MAX_TOTAL_GITIGNORE_RULES:
             raise ScanError("codebase ignore rules contain too many rules")
-        return [(base, PathSpec.from_lines("gitwildmatch", [line.strip()])) for line in lines
-                if line.strip() and not line.lstrip().startswith("#")]
+        if state["gitignore_bytes"] > MAX_TOTAL_GITIGNORE_BYTES:
+            raise ScanError("codebase ignore rules contain too many bytes")
+        patterns = []
+        for line in lines:
+            CodebaseIndexStore._check_scan_deadline(state)
+            stripped = line.strip()
+            if not stripped or line.lstrip().startswith("#"):
+                continue
+            CodebaseIndexStore._validate_gitignore_pattern(stripped)
+            try:
+                patterns.append((base, PathSpec.from_lines("gitwildmatch", [stripped])))
+            except Exception as exc:
+                raise ScanError("codebase ignore pattern is invalid") from exc
+            CodebaseIndexStore._check_scan_deadline(state)
+        return patterns
 
     @staticmethod
-    def _ignored(relative: str, rules: list[tuple[str, PathSpec]], *, is_dir: bool = False) -> bool:
+    def _ignored(relative: str, rules: list[tuple[str, PathSpec]], *, is_dir: bool = False,
+                 state: dict[str, Any] | None = None) -> bool:
+        if len(relative.encode("utf-8")) > MAX_GITIGNORE_PATTERN_BYTES:
+            raise ScanError("codebase path is too long for ignore matching")
         ignored = False
         for base, pattern in rules:
+            if state is not None:
+                CodebaseIndexStore._check_scan_deadline(state)
             candidate = relative if not base else relative.removeprefix(f"{base}/")
             if is_dir:
                 candidate += "/"
             if not base or relative == base or relative.startswith(f"{base}/"):
                 for rule in pattern.patterns:
-                    match = rule.match_file(candidate)
+                    try:
+                        match = rule.match_file(candidate)
+                    except TimeoutError as exc:
+                        raise ScanError("codebase ignore matching exceeded its deadline") from exc
+                    except Exception as exc:
+                        raise ScanError("codebase ignore matching failed") from exc
                     if match is not None:
                         ignored = bool(rule.include)
+                    if state is not None:
+                        CodebaseIndexStore._check_scan_deadline(state)
         return ignored
 
     @staticmethod
@@ -217,7 +283,7 @@ class CodebaseIndexStore:
     def _is_hard_excluded_directory(name: str) -> bool:
         return name.casefold() in {value.casefold() for value in IGNORED_DIRS}
 
-    def _read_source(self, fd: int, relative: str) -> tuple[str | None, bool, int]:
+    def _read_source(self, fd: int, relative: str, state: dict[str, Any]) -> tuple[str | None, bool, int]:
         try:
             file_stat = os.fstat(fd)
             if not stat.S_ISREG(file_stat.st_mode):
@@ -226,6 +292,7 @@ class CodebaseIndexStore:
                 return None, True, file_stat.st_size
             data = bytearray()
             while len(data) <= self.max_file_bytes:
+                self._check_scan_deadline(state)
                 block = os.read(fd, min(131_072, self.max_file_bytes + 1 - len(data)))
                 if not block:
                     break
@@ -242,30 +309,46 @@ class CodebaseIndexStore:
 
     def _scan_directory(self, fd: int, relative: str, rules: list[tuple[str, PathSpec]],
                         files: list[tuple[str, str]], skipped: list[str], stats: dict[str, int],
-                        display_relative: str = "") -> None:
+                        display_relative: str = "", depth: int = 0) -> None:
+        self._check_scan_deadline(stats)
+        if depth > MAX_DIRECTORY_DEPTH:
+            raise ScanError("codebase directory depth is too large")
+        entries = []
         try:
-            entries = sorted(os.scandir(fd), key=lambda entry: entry.name)
+            with os.scandir(fd) as iterator:
+                for entry in iterator:
+                    self._check_scan_deadline(stats)
+                    stats["visited"] += 1
+                    if stats["visited"] > MAX_VISITED_ENTRIES:
+                        raise ScanError("codebase contains too many directory entries")
+                    entries.append(entry)
+        except ScanError:
+            raise
         except OSError as exc:
             raise ScanError("codebase directory could not be read") from exc
+        self._check_scan_deadline(stats)
+        entries.sort(key=lambda entry: entry.name)
         for entry in entries:
+            self._check_scan_deadline(stats)
             child = f"{relative}/{entry.name}" if relative else entry.name
             display_child = f"{display_relative}/{entry.name}" if display_relative else entry.name
             if entry.is_symlink():
                 continue
             if entry.is_dir(follow_symlinks=False):
-                if self._is_hard_excluded_directory(entry.name) or self._ignored(child, rules, is_dir=True):
+                if self._is_hard_excluded_directory(entry.name) or self._ignored(child, rules, is_dir=True, state=stats):
                     continue
                 try:
                     child_fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                 except OSError as exc:
                     raise ScanError("codebase directory could not be opened") from exc
                 try:
-                    child_rules = rules + self._load_gitignore(child_fd, child)
-                    self._scan_directory(child_fd, child, child_rules, files, skipped, stats, display_child)
+                    child_rules = rules + self._load_gitignore(child_fd, child, stats)
+                    self._scan_directory(child_fd, child, child_rules, files, skipped, stats,
+                                         display_child, depth + 1)
                 finally:
                     os.close(child_fd)
                 continue
-            if entry.name == ".gitignore" or self._ignored(child, rules):
+            if entry.name == ".gitignore" or self._ignored(child, rules, state=stats):
                 continue
             if not entry.is_file(follow_symlinks=False):
                 try:
@@ -283,7 +366,7 @@ class CodebaseIndexStore:
             except OSError as exc:
                 raise ScanError("codebase file could not be opened") from exc
             try:
-                text, was_skipped, byte_count = self._read_source(file_fd, child)
+                text, was_skipped, byte_count = self._read_source(file_fd, child, stats)
             finally:
                 os.close(file_fd)
             stats["files"] += 1
@@ -292,15 +375,19 @@ class CodebaseIndexStore:
                 raise ScanError("repository contains too many files")
             if stats["bytes"] > MAX_REPOSITORY_BYTES:
                 raise ScanError("repository contains too many bytes")
+            self._check_scan_deadline(stats)
             if was_skipped:
                 skipped.append(display_child)
             if text is not None and (Path(entry.name).suffix.lower() in TEXT_SUFFIXES or "." not in entry.name):
                 files.append((display_child, text))
 
-    def _chunks(self, fd: int, relative: Path, rules: list[tuple[str, PathSpec]]) -> tuple[list[dict[str, Any]], list[str]]:
+    def _chunks(self, fd: int, relative: Path, rules: list[tuple[str, PathSpec]],
+                stats: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
         files: list[tuple[str, str]] = []
         skipped: list[str] = []
-        stats = {"files": 0, "bytes": 0}
+        stats.setdefault("visited", 0)
+        stats.setdefault("files", 0)
+        stats.setdefault("bytes", 0)
         try:
             rule_relative = relative.as_posix() if relative.as_posix() != "." else ""
             self._scan_directory(fd, rule_relative, rules, files, skipped, stats)
@@ -308,8 +395,10 @@ class CodebaseIndexStore:
             os.close(fd)
         chunks = []
         for path, text in files:
+            self._check_scan_deadline(stats)
             lines = text.splitlines()
             for start in range(0, len(lines), CHUNK_LINES - CHUNK_OVERLAP):
+                self._check_scan_deadline(stats)
                 body = lines[start:start + CHUNK_LINES]
                 if not body:
                     break
@@ -414,11 +503,19 @@ class CodebaseIndexStore:
         generation = None
         published = False
         fd = None
+        scan_state = {
+            "deadline": time.monotonic() + MAX_SCAN_SECONDS,
+            "visited": 0,
+            "files": 0,
+            "bytes": 0,
+            "gitignore_bytes": 0,
+            "gitignore_rules": 0,
+        }
         try:
             if not model_lock_held:
                 model_lock = self.acquire_model_lock()
             lock = self._acquire(project_id)
-            fd, relative, inherited_rules = self._open_confined_directory(requested_path)
+            fd, relative, inherited_rules = self._open_confined_directory(requested_path, scan_state)
             initial_publication_fd = self._open_flock(self._publication_lock_path(project_id))
             try:
                 fcntl.flock(initial_publication_fd, fcntl.LOCK_EX)
@@ -432,7 +529,7 @@ class CodebaseIndexStore:
                 self._release_flock(initial_publication_fd)
             scan_fd = fd
             fd = None
-            chunks, skipped = self._chunks(scan_fd, relative, inherited_rules)
+            chunks, skipped = self._chunks(scan_fd, relative, inherited_rules, scan_state)
             model = embedding_model or self._embedding_model()
             generation = secrets.token_hex(16)
             collection_name = self._collection_name(project_id, generation)

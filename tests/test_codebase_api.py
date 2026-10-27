@@ -82,6 +82,7 @@ async def test_index_scans_safe_text_with_nested_gitignore_and_line_metadata(cod
     (root / "Secrets").mkdir()
     (root / "Secrets" / "password.json").write_text("sensitive password", encoding="utf-8")
     (root / "credentials.json").write_text("sensitive credentials", encoding="utf-8")
+    (root / "id_ecdsa").write_text("PRIVATE KEY", encoding="utf-8")
     (root / "image.bin").write_bytes(b"\x00binary")
     (root / "link.py").symlink_to(root / "src" / "main.py")
     headers = {"Authorization": "Bearer codebase-test-token"}
@@ -362,6 +363,61 @@ async def test_embedding_and_chroma_batches_are_bounded(codebase_client, codebas
                                          json={"path": str(root)})
     assert response.status_code == 200
     assert batches == [128, 2]
+
+
+@pytest.mark.asyncio
+async def test_scan_pattern_deadline_and_enumeration_budgets_fail_closed(codebase_client, codebase_env, monkeypatch):
+    headers = {"Authorization": "Bearer codebase-test-token"}
+
+    unsafe = codebase_env / "roots" / "unsafe-pattern"
+    unsafe.mkdir()
+    (unsafe / ".gitignore").write_text("*a*b*\n", encoding="utf-8")
+    response = await codebase_client.post("/codebase/projects/unsafe-pattern/index", headers=headers,
+                                          json={"path": str(unsafe)})
+    assert response.status_code == 422
+
+    aggregate_rules = codebase_env / "roots" / "aggregate-rules"
+    nested = aggregate_rules / "nested"
+    nested.mkdir(parents=True)
+    (aggregate_rules / ".gitignore").write_text("one.py\n", encoding="utf-8")
+    (nested / ".gitignore").write_text("two.py\n", encoding="utf-8")
+    monkeypatch.setattr(index_store, "MAX_TOTAL_GITIGNORE_RULES", 1)
+    response = await codebase_client.post("/codebase/projects/aggregate-rules/index", headers=headers,
+                                          json={"path": str(aggregate_rules)})
+    assert response.status_code == 422
+    monkeypatch.setattr(index_store, "MAX_TOTAL_GITIGNORE_RULES", 50_000)
+    monkeypatch.setattr(index_store, "MAX_TOTAL_GITIGNORE_BYTES", 1)
+    response = await codebase_client.post("/codebase/projects/aggregate-rules-bytes/index", headers=headers,
+                                          json={"path": str(aggregate_rules)})
+    assert response.status_code == 422
+    monkeypatch.setattr(index_store, "MAX_TOTAL_GITIGNORE_BYTES", 8 * 1024 * 1024)
+
+    visited = codebase_env / "roots" / "visited-budget"
+    visited.mkdir()
+    (visited / "one.py").write_text("one", encoding="utf-8")
+    (visited / "two.py").write_text("two", encoding="utf-8")
+    monkeypatch.setattr(index_store, "MAX_VISITED_ENTRIES", 1)
+    response = await codebase_client.post("/codebase/projects/visited-budget/index", headers=headers,
+                                          json={"path": str(visited)})
+    assert response.status_code == 422
+
+    depth = codebase_env / "roots" / "depth-budget" / "one" / "two"
+    depth.mkdir(parents=True)
+    (depth / "main.py").write_text("deep", encoding="utf-8")
+    monkeypatch.setattr(index_store, "MAX_VISITED_ENTRIES", 100_000)
+    monkeypatch.setattr(index_store, "MAX_DIRECTORY_DEPTH", 1)
+    response = await codebase_client.post("/codebase/projects/depth-budget/index", headers=headers,
+                                          json={"path": str(codebase_env / "roots" / "depth-budget")})
+    assert response.status_code == 422
+
+    deadline = codebase_env / "roots" / "deadline-budget"
+    deadline.mkdir()
+    (deadline / "main.py").write_text("deadline", encoding="utf-8")
+    monkeypatch.setattr(index_store, "MAX_DIRECTORY_DEPTH", 64)
+    monkeypatch.setattr(index_store, "MAX_SCAN_SECONDS", 0)
+    response = await codebase_client.post("/codebase/projects/deadline-budget/index", headers=headers,
+                                          json={"path": str(deadline)})
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
