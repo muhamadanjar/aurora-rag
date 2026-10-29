@@ -1,6 +1,5 @@
 from langchain_chroma import Chroma
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.llms import Ollama
+from langchain_ollama import OllamaEmbeddings, OllamaLLM
 
 CHROMA_DIRECTORY = "./data/chroma_data"
 CHROMA_COLLECTION = "source_code"
@@ -14,8 +13,23 @@ def create_vector_store(embedding_model: str) -> Chroma:
     )
 
 
-def create_chat_model(model: str) -> Ollama:
-    return Ollama(model=model)
+def create_chat_model(
+    model: str,
+    *,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+) -> OllamaLLM:
+    options = {
+        key: value
+        for key, value in {
+            "temperature": temperature,
+            "top_p": top_p,
+            "num_predict": max_tokens,
+        }.items()
+        if value is not None
+    }
+    return OllamaLLM(model=model, **options)
 
 
 def format_docs(documents) -> str:

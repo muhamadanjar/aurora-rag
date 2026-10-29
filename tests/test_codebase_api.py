@@ -6,6 +6,8 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+from app.core.config import get_codebase_settings
+from app.delivery.dependencies import get_optional_uow
 from app.infrastructure.codebase import index_store
 from app.infrastructure.codebase.index_store import CodebaseIndexStore, ProjectBusy
 from app.main import app
@@ -24,25 +26,33 @@ class FakeEmbeddings:
 
 @pytest.fixture
 def codebase_env(tmp_path, monkeypatch):
+    get_codebase_settings.cache_clear()
     monkeypatch.setenv("AURORA_CODEBASE_TOKEN", "codebase-test-token")
     monkeypatch.setenv("AURORA_CODEBASE_ROOTS", str(tmp_path / "roots"))
     monkeypatch.setenv("AURORA_CODEBASE_INDEX_ROOT", str(tmp_path / "index"))
     (tmp_path / "roots").mkdir()
     monkeypatch.setattr(index_store, "CHROMA_DIRECTORY", str(tmp_path / "chroma"))
     monkeypatch.setattr(index_store, "OllamaEmbeddings", FakeEmbeddings)
-    return tmp_path
+    yield tmp_path
+    get_codebase_settings.cache_clear()
 
 
 @pytest_asyncio.fixture
-async def codebase_client(codebase_env):
+async def codebase_client(codebase_env, monkeypatch):
+    async def no_uow():
+        yield None
+
+    monkeypatch.setitem(app.dependency_overrides, get_optional_uow, no_uow)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         yield client
 
 
 @pytest.mark.asyncio
 async def test_codebase_endpoints_fail_closed_and_require_exact_bearer(codebase_client, monkeypatch):
-    monkeypatch.delenv("AURORA_CODEBASE_TOKEN")
+    monkeypatch.setenv("AURORA_CODEBASE_TOKEN", "")
+    get_codebase_settings.cache_clear()
     assert (await codebase_client.get("/codebase/projects")).status_code == 503
+    get_codebase_settings.cache_clear()
     monkeypatch.setenv("AURORA_CODEBASE_TOKEN", "codebase-test-token")
     assert (await codebase_client.get("/codebase/projects")).status_code == 401
     assert (await codebase_client.get("/codebase/projects", headers={"Authorization": "Bearer codebase-test-token"})).status_code == 200
@@ -474,3 +484,49 @@ async def test_search_project_busy_is_http_409(codebase_client, monkeypatch):
         json={"project_id": "demo", "query": "query", "limit": 1},
     )
     assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_codebase_endpoint_loads_token_and_roots_from_dotenv(codebase_client, codebase_env, monkeypatch, tmp_path):
+    root = codebase_env / "roots" / "dotenv-repo"
+    root.mkdir()
+    (root / "main.py").write_text("dotenv configured source", encoding="utf-8")
+    index_root = tmp_path / "index"
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        f'AURORA_CODEBASE_TOKEN="dotenv-token"\n'
+        f'AURORA_CODEBASE_ROOTS="{codebase_env / "roots"}"\n'
+        f'AURORA_CODEBASE_INDEX_ROOT="{index_root}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("AURORA_CODEBASE_TOKEN", raising=False)
+    monkeypatch.delenv("AURORA_CODEBASE_ROOTS", raising=False)
+    monkeypatch.delenv("AURORA_CODEBASE_INDEX_ROOT", raising=False)
+    get_codebase_settings.cache_clear()
+    monkeypatch.chdir(tmp_path)
+
+    response = await codebase_client.post(
+        "/codebase/projects/dotenv-repo/index",
+        headers={"Authorization": "Bearer dotenv-token"},
+        json={"path": str(root)},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["indexed_chunks"] == 1
+
+
+@pytest.mark.asyncio
+async def test_index_accepts_repository_over_previous_64_mib_limit(codebase_client, codebase_env):
+    root = codebase_env / "roots" / "large-repo"
+    root.mkdir()
+    with (root / "large-asset.bin").open("wb") as asset:
+        asset.truncate(65 * 1024 * 1024)
+
+    response = await codebase_client.post(
+        "/codebase/projects/large-repo/index",
+        headers={"Authorization": "Bearer codebase-test-token"},
+        json={"path": str(root)},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["skipped_files"] == 1

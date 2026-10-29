@@ -19,6 +19,7 @@ from app.core.exceptions import (
     PreconditionRequired,
     ResourceConflict,
 )
+from app.delivery.cors import configure_cors
 from app.delivery.middleware import ChatRequestBodyLimitMiddleware
 from app.delivery.routers.auth_router import router as auth_router
 from app.delivery.routers.codebase_router import router as codebase_router
@@ -49,6 +50,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.add_middleware(ChatRequestBodyLimitMiddleware)
+configure_cors(app)
 app.include_router(auth_router)
 app.include_router(dataset_router)
 app.include_router(runtime_router)

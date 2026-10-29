@@ -1,14 +1,11 @@
-import hmac
-import os
 import asyncio
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import ValidationError
 
 from app.application.codebase.service import CodebaseService
 from app.application.rag.config_service import load_configuration
-from app.delivery.dependencies import get_optional_uow
+from app.delivery.dependencies import get_optional_uow, require_codebase_token
 from app.domain.unit_of_work import UnitOfWork
 from app.delivery.schemas.codebase import (
     CodebaseIndexRequest, CodebaseProjectListResponse, CodebaseSearchRequest,
@@ -17,16 +14,12 @@ from app.delivery.schemas.codebase import (
 from app.infrastructure.codebase.index_store import (CodebaseIndexError, CodebaseIndexStore,
                                                        InvalidProject, ProjectBusy, RootNotAllowed)
 
-router = APIRouter(prefix="/codebase", tags=["codebase"])
-_bearer = HTTPBearer(auto_error=False)
 
-
-def require_codebase_token(credentials: HTTPAuthorizationCredentials | None = Depends(_bearer)):
-    expected = os.getenv("AURORA_CODEBASE_TOKEN")
-    if not expected or not expected.strip():
-        raise HTTPException(status_code=503, detail="Codebase indexing is not configured")
-    if not credentials or credentials.scheme.lower() != "bearer" or not hmac.compare_digest(credentials.credentials, expected):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
+router = APIRouter(
+    prefix="/codebase",
+    tags=["codebase"],
+    dependencies=[Depends(require_codebase_token)],
+)
 
 
 def _service(store: CodebaseIndexStore | None = None) -> CodebaseService:
@@ -34,8 +27,11 @@ def _service(store: CodebaseIndexStore | None = None) -> CodebaseService:
 
 
 @router.post("/projects/{project_id}/index")
-async def index_project(project_id: str, body: CodebaseIndexRequest, _: None = Depends(require_codebase_token),
-                        uow: UnitOfWork | None = Depends(get_optional_uow)):
+async def index_project(
+    project_id: str,
+    body: CodebaseIndexRequest,
+    uow: UnitOfWork | None = Depends(get_optional_uow),
+):
     store = CodebaseIndexStore()
     model_lock = None
     try:
@@ -59,7 +55,7 @@ async def index_project(project_id: str, body: CodebaseIndexRequest, _: None = D
 
 
 @router.delete("/projects/{project_id}", status_code=204)
-async def delete_project(project_id: str, _: None = Depends(require_codebase_token)):
+async def delete_project(project_id: str):
     try:
         await asyncio.to_thread(_service().delete, project_id)
     except ProjectBusy as exc:
@@ -69,14 +65,16 @@ async def delete_project(project_id: str, _: None = Depends(require_codebase_tok
 
 
 @router.get("/projects", response_model=CodebaseProjectListResponse)
-async def list_projects(_: None = Depends(require_codebase_token)):
+async def list_projects():
     projects = await asyncio.to_thread(_service().projects)
     return {"projects": [{"project_id": project} for project in projects]}
 
 
 @router.post("/search", response_model=CodebaseSearchResponse)
-async def search_codebase(body: CodebaseSearchRequest, _: None = Depends(require_codebase_token),
-                          uow: UnitOfWork | None = Depends(get_optional_uow)):
+async def search_codebase(
+    body: CodebaseSearchRequest,
+    uow: UnitOfWork | None = Depends(get_optional_uow),
+):
     try:
         configuration = await load_configuration(uow.configurations if uow else None)
         results = await asyncio.to_thread(

@@ -15,7 +15,7 @@ from alembic import command
 from alembic.config import Config
 from anyio import to_thread
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -35,13 +35,23 @@ def database_url():
 @pytest_asyncio.fixture
 async def client(tmp_path, database_url, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("EXPORT_ROOT", str(tmp_path))
     monkeypatch.setenv("AUTH_USERNAME", "operator")
     monkeypatch.setenv("AUTH_PASSWORD_HASH", bcrypt.hashpw(b"secret", bcrypt.gensalt()).decode())
     monkeypatch.setenv("JWT_SECRET", "test-secret-012345678901234567890123456789")
     monkeypatch.setenv("OPERATOR_UUID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("EXPORT_ROOT", str(tmp_path))
+    monkeypatch.setenv("AURORA_RAG_TOKEN", "rag-test-token")
     get_settings.cache_clear()
     db.session_factory.cache_clear()
+
+    reset_engine = create_async_engine(database_url)
+    async with reset_engine.begin() as connection:
+        datasets_exist = await connection.run_sync(
+            lambda sync_connection: inspect(sync_connection).has_table("training_datasets")
+        )
+        if datasets_exist:
+            await connection.execute(text("TRUNCATE TABLE training_datasets CASCADE"))
+    await reset_engine.dispose()
 
     alembic_config = Config(str(Path(__file__).parents[1] / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(Path(__file__).parents[1] / "alembic"))
@@ -137,16 +147,29 @@ async def test_dataset_version_etag_duplicate_titles_and_null_title(client):
 
 
 @pytest.mark.asyncio
-async def test_format_type_is_constrained_to_chatml(client):
+async def test_dataset_supports_chatml_and_alpaca_formats(client):
     headers = await login(client)
-    invalid = await client.post("/datasets", headers=headers, json={"title": "unsupported", "format_type": "alpaca"})
-    assert invalid.status_code == 422
-    dataset = await client.post("/datasets", headers=headers, json={"title": "chatml-only"})
+    chatml = await client.post("/datasets", headers=headers, json={"title": "ChatML"})
+    alpaca = await client.post(
+        "/datasets",
+        headers=headers,
+        json={"title": "Alpaca", "format_type": "alpaca"},
+    )
+    unsupported = await client.post(
+        "/datasets",
+        headers=headers,
+        json={"title": "Unsupported", "format_type": "jsonl"},
+    )
+    assert chatml.status_code == alpaca.status_code == 201
+    assert chatml.json()["format_type"] == "chatml"
+    assert alpaca.json()["format_type"] == "alpaca"
+    assert unsupported.status_code == 422
+
     async with db.SessionLocal() as session:
         with pytest.raises(IntegrityError):
             await session.execute(
-                text("UPDATE training_datasets SET format_type = 'alpaca' WHERE id = :dataset_id"),
-                {"dataset_id": UUID(dataset.json()["id"])},
+                text("UPDATE training_datasets SET format_type = 'jsonl' WHERE id = :dataset_id"),
+                {"dataset_id": UUID(alpaca.json()["id"])},
             )
 
 @pytest.mark.asyncio
@@ -571,7 +594,31 @@ async def test_legacy_query_uses_runtime_configuration_without_changing_response
     )
     assert updated.status_code == 200
 
-    response = await client.post("/query", json={"question": "What is the answer?"})
+    monkeypatch.delenv("AURORA_RAG_TOKEN")
+    unconfigured = await client.post("/query", json={"question": "What is the answer?"})
+    assert unconfigured.status_code == 503
+    monkeypatch.setenv("AURORA_RAG_TOKEN", "rag-test-token")
+
+    unauthorized = await client.post("/query", json={"question": "What is the answer?"})
+    assert unauthorized.status_code == 401
+    unauthorized_ingest = await client.post(
+        "/ingest",
+        json={"code_content": "sample", "file_path": "sample.py", "language": "python"},
+    )
+    assert unauthorized_ingest.status_code == 401
+
+    management_headers = await login(client)
+    management_token_rejected = await client.post(
+        "/query",
+        headers=management_headers,
+        json={"question": "What is the answer?"},
+    )
+    assert management_token_rejected.status_code == 401
+    response = await client.post(
+        "/query",
+        headers={"Authorization": "Bearer rag-test-token"},
+        json={"question": "What is the answer?"},
+    )
     assert response.status_code == 200
     assert response.json() == {"answer": "42"}
 
@@ -601,7 +648,7 @@ async def test_chat_generation_errors_do_not_leak_upstream_details(client, monke
 
 
 @pytest.mark.asyncio
-async def test_chat_request_limits_and_generation_overrides_are_rejected(client):
+async def test_chat_request_limits(client):
     headers = await login(client)
     too_many_messages = await client.post(
         "/api/v1/chat/completions",
@@ -622,18 +669,18 @@ async def test_chat_request_limits_and_generation_overrides_are_rejected(client)
             ]
         },
     )
-    generation_override = await client.post(
+    invalid_generation = await client.post(
         "/api/v1/chat/completions",
         headers=headers,
         json={
             "messages": [{"role": "user", "content": "hello"}],
-            "temperature": 0,
+            "temperature": 2.1,
         },
     )
     assert too_many_messages.status_code == 422
     assert oversized_message.status_code == 422
     assert oversized_transcript.status_code == 422
-    assert generation_override.status_code == 422
+    assert invalid_generation.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -650,3 +697,127 @@ async def test_chat_http_body_limit_rejects_oversized_unauthenticated_body(clien
         headers={"Content-Type": "application/json"},
     )
     assert response.status_code == 413
+@pytest.mark.asyncio
+async def test_alpaca_examples_validate_review_export_and_include_current_revision(client):
+    headers = await login(client)
+    dataset = await client.post(
+        "/datasets",
+        headers=headers,
+        json={"title": "instructions", "format_type": "alpaca"},
+    )
+    dataset_id = dataset.json()["id"]
+    example = await client.post(
+        f"/datasets/{dataset_id}/examples",
+        headers=headers,
+        json={
+            "system_prompt": "Respect source context.",
+            "content": {
+                "instruction": "Summarize the document.",
+                "input": "Long source text.",
+                "output": "A concise summary.",
+            },
+        },
+    )
+    assert example.status_code == 201
+    example_id = example.json()["example"]["id"]
+    revision_id = example.json()["revision"]["id"]
+
+    listed = await client.get(
+        f"/datasets/{dataset_id}/examples?page=1&per_page=1",
+        headers=headers,
+    )
+    assert len(listed.json()) == 1
+    listed_example = listed.json()[0]
+    assert listed_example["id"] == example_id
+    assert listed_example["current_revision"]["id"] == revision_id
+    assert listed_example["current_revision"]["content"] == example.json()["revision"]["content"]
+
+    invalid_example = await client.post(
+        f"/datasets/{dataset_id}/examples",
+        headers=headers,
+        json={"content": {"instruction": "Incomplete example"}},
+    )
+    invalid_revision_id = invalid_example.json()["revision"]["id"]
+    invalid = await client.post(
+        f"/datasets/{dataset_id}/examples/{invalid_example.json()['example']['id']}/revisions/{invalid_revision_id}/validate",
+        headers={**headers, "If-Match": invalid_example.headers["revision-etag"]},
+    )
+    assert invalid.status_code == 422
+    assert invalid.json()["detail"]["code"] == "INVALID_ALPACA"
+    assert any("output" in error for error in invalid.json()["detail"]["errors"])
+
+    validated = await client.post(
+        f"/datasets/{dataset_id}/examples/{example_id}/revisions/{revision_id}/validate",
+        headers={**headers, "If-Match": example.headers["revision-etag"]},
+    )
+    assert validated.status_code == 200
+    assert validated.json()["validation_status"] == "valid"
+    reviewed = await client.post(
+        f"/datasets/{dataset_id}/examples/{example_id}/revisions/{revision_id}/review",
+        headers={**headers, "If-Match": validated.headers["etag"]},
+        json={"approved": True, "review_note": "Reviewed"},
+    )
+    assert reviewed.status_code == 200
+
+    exported = await client.post(f"/datasets/{dataset_id}/exports", headers=headers)
+    assert exported.status_code == 201
+    assert exported.json()["manifest"]["format_type"] == "alpaca"
+    assert exported.json()["manifest"]["chatml"] is False
+    download = await client.get(
+        f"/datasets/{dataset_id}/exports/{exported.json()['id']}/download",
+        headers=headers,
+    )
+    assert download.status_code == 200
+    assert json.loads(download.text) == {
+        "instruction": "Summarize the document.",
+        "input": "Long source text.",
+        "output": "A concise summary.",
+        "system_prompt": "Respect source context.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_apply_generation_overrides(client, monkeypatch):
+    from app.delivery.routers import runtime_router as runtime_routes
+
+    captured: dict[str, object] = {}
+
+    class EvidenceStore:
+        def similarity_search(self, _query, *, k):
+            assert k == 4
+            return []
+
+    class EvidenceModel:
+        async def ainvoke(self, prompt):
+            captured["prompt"] = prompt
+            return "answer"
+
+    def model_factory(model, **options):
+        captured["model"] = model
+        captured["options"] = options
+        return EvidenceModel()
+
+    monkeypatch.setattr(runtime_routes, "create_vector_store", lambda _model: EvidenceStore())
+    monkeypatch.setattr(runtime_routes, "create_chat_model", model_factory)
+    headers = await login(client)
+    response = await client.post(
+        "/api/v1/chat/completions",
+        headers=headers,
+        json={
+            "messages": [{"role": "user", "content": "question"}],
+            "stream": False,
+            "system_prompt": "Answer in one sentence.",
+            "temperature": 0.25,
+            "top_p": 0.8,
+            "max_tokens": 256,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "answer"
+    assert captured["model"] == "llama3"
+    assert captured["options"] == {
+        "temperature": 0.25,
+        "top_p": 0.8,
+        "max_tokens": 256,
+    }
+    assert "Answer in one sentence." in str(captured["prompt"])

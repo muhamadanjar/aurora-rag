@@ -1,12 +1,15 @@
+import hmac
+import os
+
 from collections.abc import AsyncGenerator
 from uuid import UUID
 
-import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError
 from pydantic import ValidationError
 
-from app.core.config import Settings, get_settings
+from app.core.config import Settings, get_codebase_settings, get_settings
 from app.domain.unit_of_work import UnitOfWork
 from app.infrastructure.db.connection import create_unit_of_work
 from app.infrastructure.security.tokens import decode_subject
@@ -56,12 +59,48 @@ async def current_operator(
         )
     try:
         subject = decode_subject(credentials.credentials, settings)
-    except (jwt.PyJWTError, KeyError, ValueError) as exc:
+    except (JWTError, KeyError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
         ) from exc
-    if subject != settings.operator_uuid:
+    if subject != settings.auth_username:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid operator"
         )
-    return subject
+    return settings.operator_uuid
+
+
+def require_rag_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+) -> None:
+    expected = os.getenv("AURORA_RAG_TOKEN")
+    if not expected or not expected.strip():
+        raise HTTPException(status_code=503, detail="RAG API is not configured")
+    if (
+        not credentials
+        or credentials.scheme.lower() != "bearer"
+        or not hmac.compare_digest(credentials.credentials, expected)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid bearer token",
+        )
+
+
+def require_codebase_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+) -> None:
+    expected = get_codebase_settings().aurora_codebase_token
+    if not expected or not expected.strip():
+        raise HTTPException(
+            status_code=503, detail="Codebase indexing is not configured"
+        )
+    if (
+        not credentials
+        or credentials.scheme.lower() != "bearer"
+        or not hmac.compare_digest(credentials.credentials, expected)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid bearer token",
+        )

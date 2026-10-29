@@ -69,7 +69,14 @@ async def chat_completions(
         ChatMessage(role=message.role, content=message.content)
         for message in body.messages
     ]
-    run = await service.prepare_chat(messages, body.model)
+    run = await service.prepare_chat(
+        messages,
+        body.model,
+        system_prompt=body.system_prompt,
+        temperature=body.temperature,
+        top_p=body.top_p,
+        max_tokens=body.max_tokens,
+    )
 
     if not body.stream:
         try:

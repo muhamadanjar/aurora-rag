@@ -8,9 +8,11 @@ from app.core.exceptions import (
     PreconditionFailed,
     ResourceConflict,
 )
+from app.domain.dataset.alpaca import validate_alpaca
 from app.domain.dataset.chatml import validate_chatml
 from app.domain.dataset.entities import (
     Dataset,
+    DatasetFormat,
     DatasetStatus,
     Example,
     ExampleStatus,
@@ -33,14 +35,19 @@ class DatasetService:
         self._uow = uow
 
     async def create_dataset(
-        self, *, title: str, description: str | None, actor: UUID
+        self,
+        *,
+        title: str,
+        description: str | None,
+        format_type: DatasetFormat,
+        actor: UUID,
     ) -> Dataset:
         timestamp = _now()
         dataset = Dataset(
             id=new_uuid7(),
             title=title,
             description=description,
-            format_type="chatml",
+            format_type=format_type,
             version=1,
             status=DatasetStatus.active,
             created_by=actor,
@@ -108,7 +115,7 @@ class DatasetService:
         self,
         *,
         dataset_id: UUID,
-        content: list[dict[str, Any]],
+        content: Any,
         system_prompt: str | None,
         schema_version: str,
         actor: UUID,
@@ -149,7 +156,7 @@ class DatasetService:
 
     async def list_examples(
         self, *, dataset_id: UUID, page: int, per_page: int
-    ) -> list[Example]:
+    ) -> list[tuple[Example, Revision | None]]:
         return await self._uow.examples.list_by_dataset(
             dataset_id, offset=(page - 1) * per_page, limit=per_page
         )
@@ -179,7 +186,7 @@ class DatasetService:
         *,
         dataset_id: UUID,
         example_id: UUID,
-        content: list[dict[str, Any]],
+        content: Any,
         system_prompt: str | None,
         schema_version: str,
         actor: UUID,
@@ -224,13 +231,18 @@ class DatasetService:
         actor: UUID,
         expected_revision_version: int | None,
     ) -> tuple[Revision, list[str]]:
+        dataset = await self.get_active_dataset(dataset_id, for_update=True)
         await self._get_active_example(dataset_id, example_id, for_update=True)
         revision = await self._get_revision(
             example_id, revision_id, for_update=True
         )
         _require_version(revision.version, expected_revision_version)
 
-        errors = validate_chatml(revision.content)
+        errors = (
+            validate_chatml(revision.content)
+            if dataset.format_type == "chatml"
+            else validate_alpaca(revision.content)
+        )
         timestamp = _now()
         revision.validation_errors = errors or None
         revision.validation_status = (

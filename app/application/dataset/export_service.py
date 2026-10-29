@@ -136,9 +136,17 @@ async def create_export(
                 .order_by(TrainingExampleRevision.id)
             )
             async for revision in stream:
-                record = {"messages": revision.content}
-                if revision.system_prompt:
-                    record["messages"] = [{"role": "system", "content": revision.system_prompt}, *record["messages"]]
+                if locked_dataset.format_type == "chatml":
+                    record = {"messages": revision.content}
+                    if revision.system_prompt:
+                        record["messages"] = [
+                            {"role": "system", "content": revision.system_prompt},
+                            *revision.content,
+                        ]
+                else:
+                    record = dict(revision.content)
+                    if revision.system_prompt:
+                        record["system_prompt"] = revision.system_prompt
                 data = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
                 await handle.write(data)
                 digest.update(data)
@@ -164,7 +172,7 @@ async def create_export(
             "format_type": locked_dataset.format_type,
             "export_schema_version": "1",
             "serialization": "jsonl",
-            "chatml": True,
+            "chatml": locked_dataset.format_type == "chatml",
             "checksum_sha256": export.checksum_sha256,
             "item_count": record_count,
             "revision_ids": revision_ids,

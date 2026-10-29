@@ -34,10 +34,13 @@ async def create_dataset(
     body: DatasetCreate,
     response: Response,
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
 ):
     dataset = await DatasetService(uow).create_dataset(
-        title=body.title, description=body.description, actor=actor
+        title=body.title,
+        description=body.description,
+        format_type=body.format_type,
+        actor=actor,
     )
     response.headers["ETag"] = entity_etag(dataset)
     return dataset
@@ -48,7 +51,7 @@ async def list_datasets(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
 ):
     datasets, total = await DatasetService(uow).list_datasets(
         page=page, per_page=per_page
@@ -71,7 +74,7 @@ async def get_dataset(
     dataset_id: UUID,
     response: Response,
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
 ):
     dataset = await DatasetService(uow).get_dataset(dataset_id)
     if dataset is None:
@@ -87,7 +90,7 @@ async def update_dataset(
     response: Response,
     if_match: str | None = Header(default=None),
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
 ):
     expected_version = parse_if_match(if_match)
     service = DatasetService(uow)
@@ -107,7 +110,7 @@ async def archive_dataset(
     dataset_id: UUID,
     if_match: str | None = Header(default=None),
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
 ):
     expected_version = parse_if_match(if_match)
     service = DatasetService(uow)
@@ -126,7 +129,7 @@ async def create_example(
     body: ExampleCreate,
     response: Response,
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
 ):
     example, revision = await DatasetService(uow).create_example(
         dataset_id=dataset_id,
@@ -146,13 +149,20 @@ async def list_examples(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
 ):
     service = DatasetService(uow)
     await service.get_active_dataset(dataset_id)
-    return await service.list_examples(
+    examples = await service.list_examples(
         dataset_id=dataset_id, page=page, per_page=per_page
     )
+    return [
+        {
+            **example.__dict__,
+            "current_revision": revision,
+        }
+        for example, revision in examples
+    ]
 
 
 # ── revisions ─────────────────────────────────────────────────────────────────
@@ -166,7 +176,7 @@ async def create_revision(
     response: Response,
     if_match: str | None = Header(default=None),
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
 ):
     expected_version = parse_if_match(if_match)
     example, revision = await DatasetService(uow).create_revision(
@@ -193,10 +203,12 @@ async def validate_revision(
     response: Response,
     if_match: str | None = Header(default=None),
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
 ):
     expected_version = parse_if_match(if_match)
-    revision, errors = await DatasetService(uow).validate_revision(
+    service = DatasetService(uow)
+    dataset = await service.get_active_dataset(dataset_id)
+    revision, errors = await service.validate_revision(
         dataset_id=dataset_id,
         example_id=example_id,
         revision_id=revision_id,
@@ -205,7 +217,8 @@ async def validate_revision(
     )
     if errors:
         raise HTTPException(
-            status_code=422, detail={"code": "INVALID_CHATML", "errors": errors}
+            status_code=422,
+            detail={"code": f"INVALID_{dataset.format_type.upper()}", "errors": errors},
         )
     response.headers["ETag"] = entity_etag(revision)
     return revision
@@ -222,7 +235,7 @@ async def review_revision(
     response: Response,
     if_match: str | None = Header(default=None),
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
 ):
     expected_version = parse_if_match(if_match)
     revision, example = await DatasetService(uow).review_revision(
@@ -246,7 +259,7 @@ async def retire_example(
     response: Response,
     if_match: str | None = Header(default=None),
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
 ):
     expected_version = parse_if_match(if_match)
     example = await DatasetService(uow).retire_example(
@@ -269,7 +282,7 @@ async def retire_example(
 async def export_dataset(
     dataset_id: UUID,
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
     settings: Settings = Depends(require_settings),
 ):
     dataset = await DatasetService(uow).get_active_dataset(
@@ -288,7 +301,7 @@ async def export_status(
     dataset_id: UUID,
     export_id: UUID,
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
 ):
     return await get_export(uow.session, dataset_id, export_id)
 
@@ -298,7 +311,7 @@ async def download_export(
     dataset_id: UUID,
     export_id: UUID,
     uow: UnitOfWork = Depends(get_uow),
-    actor: UUID = Depends(current_operator),
+    actor: str = Depends(current_operator),
     settings: Settings = Depends(require_settings),
 ):
     path = await resolve_download_path(

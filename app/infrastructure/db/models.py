@@ -48,7 +48,7 @@ class TrainingDataset(SQLModel, table=True):
     id: UUID = Field(default_factory=new_uuid7, primary_key=True)
     title: str = Field(sa_column=Column(String(200), nullable=False))
     description: Optional[str] = Field(default=None, sa_column=Column(Text))
-    format_type: Literal["chatml"] = Field(default="chatml", sa_column=Column(String(20), nullable=False))
+    format_type: Literal["chatml", "alpaca"] = Field(default="chatml", sa_column=Column(String(20), nullable=False))
     version: int = Field(default=1, nullable=False)
     status: DatasetStatus = Field(default=DatasetStatus.active, sa_column=Column(SAEnum(DatasetStatus, name="dataset_status", native_enum=True), nullable=False))
     created_by: UUID
@@ -57,7 +57,7 @@ class TrainingDataset(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=now, sa_column=Column(DateTime(timezone=True), nullable=False))
     archived_at: Optional[datetime] = Field(default=None, sa_column=Column(DateTime(timezone=True)))
 
-    __table_args__ = (CheckConstraint("format_type = 'chatml'", name="ck_training_datasets_format_type_chatml"),)
+    __table_args__ = (CheckConstraint("format_type IN ('chatml', 'alpaca')", name="ck_training_datasets_format_type_supported"),)
 
 class TrainingExample(SQLModel, table=True):
     __tablename__ = "training_examples"
@@ -81,7 +81,7 @@ class TrainingExampleRevision(SQLModel, table=True):
     example_id: UUID = Field(sa_column=Column(PGUUID(as_uuid=True), ForeignKey("training_examples.id", name="fk_training_example_revisions_example_id"), nullable=False))
     revision_number: int = Field(sa_column=Column(Integer, nullable=False))
     version: int = Field(default=1, nullable=False)
-    content: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False))
+    content: Any = Field(default_factory=list, sa_column=Column(JSONB, nullable=False))
     system_prompt: Optional[str] = Field(default=None, sa_column=Column(Text))
     schema_version: str = Field(default="1", sa_column=Column(String(32), nullable=False))
     validation_status: RevisionState = Field(default=RevisionState.pending, sa_column=Column(SAEnum(RevisionState, name="revision_validation_status", native_enum=True), nullable=False))

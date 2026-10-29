@@ -17,17 +17,17 @@ from typing import Any
 import chromadb
 import regex as safe_regex
 from filelock import FileLock, Timeout
-from langchain_community.embeddings import OllamaEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from pathspec import PathSpec
 
 from app.application.rag.config_service import DEFAULT_CONFIGURATION
+from app.core.config import get_codebase_settings
 from app.infrastructure.rag.vector_store import CHROMA_DIRECTORY
 
 PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 LEGACY_PROJECT_ID = "legacy"
-DEFAULT_INDEX_ROOT = Path("./data/codebase_index")
 DEFAULT_MAX_FILE_BYTES = 1_048_576
-MAX_REPOSITORY_BYTES = 64 * 1024 * 1024
+MAX_REPOSITORY_BYTES = 128 * 1024 * 1024
 MAX_REPOSITORY_FILES = 10_000
 MAX_REPOSITORY_CHUNKS = 50_000
 EMBEDDING_BATCH_SIZE = 128
@@ -78,7 +78,11 @@ class ScanError(CodebaseIndexError):
 
 class CodebaseIndexStore:
     def __init__(self, *, index_root: Path | None = None, max_file_bytes: int = DEFAULT_MAX_FILE_BYTES):
-        self.root = Path(os.getenv("AURORA_CODEBASE_INDEX_ROOT", str(index_root or DEFAULT_INDEX_ROOT))).resolve()
+        configured_root = (
+            get_codebase_settings().aurora_codebase_index_root
+            if index_root is None else index_root
+        )
+        self.root = Path(os.path.expandvars(os.path.expanduser(str(configured_root)))).resolve()
         self.chroma_root = Path(CHROMA_DIRECTORY).resolve()
         self.max_file_bytes = max_file_bytes
 
@@ -116,8 +120,12 @@ class CodebaseIndexStore:
 
     @staticmethod
     def configured_roots() -> list[Path]:
-        raw = os.getenv("AURORA_CODEBASE_ROOTS", "")
-        return [Path(os.path.abspath(os.path.expanduser(value))) for value in raw.split(os.pathsep) if value.strip()]
+        raw = get_codebase_settings().aurora_codebase_roots
+        return [
+            Path(os.path.abspath(os.path.expandvars(os.path.expanduser(value.strip()))))
+            for value in raw.split(os.pathsep)
+            if value.strip()
+        ]
 
     @staticmethod
     def _open_directory_components(path: Path) -> int:
@@ -402,7 +410,10 @@ class CodebaseIndexStore:
 
     @staticmethod
     def _embedding_model() -> str:
-        return os.getenv("AURORA_CODEBASE_EMBEDDING_MODEL", DEFAULT_CONFIGURATION["embedding.model"])
+        return (
+            get_codebase_settings().aurora_codebase_embedding_model
+            or DEFAULT_CONFIGURATION["embedding.model"]
+        )
 
     @staticmethod
     def _collection_name(project_id: str, generation: str) -> str:

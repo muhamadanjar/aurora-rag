@@ -23,7 +23,7 @@ async def token(
         access_token = await LoginService(
             settings,
             verify_password=verify_password,
-            issue_token=lambda cfg: create_access_token(cfg.operator_uuid, cfg),
+            issue_token=lambda cfg: create_access_token(cfg.auth_username, cfg),
         ).login(form.username, form.password, client_key)
     except TooManyLoginAttempts as exc:
         raise HTTPException(

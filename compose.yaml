@@ -1,0 +1,52 @@
+name: aurora-rag
+
+x-aurora-env-file: &aurora-env-file
+  - path: .env.docker
+    format: raw
+
+x-aurora-environment: &aurora-environment
+  DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-aurora}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.docker}@host.docker.internal:5432/${POSTGRES_DB:-aurora}"
+  EXPORT_ROOT: /app/data/exports
+  AURORA_CODEBASE_ROOTS: /workspace/projects
+  AURORA_CODEBASE_INDEX_ROOT: /app/data/codebase_index
+
+services:
+  api:
+    build:
+      context: .
+    image: aurora-rag:local
+    env_file: *aurora-env-file
+    environment:
+      <<: *aurora-environment
+      OLLAMA_HOST: "${OLLAMA_HOST:-http://host.docker.internal:11434}"
+    ports:
+      - "127.0.0.1:${AURORA_PORT:-8007}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - aurora_data:/app/data
+      - "${AURORA_CODEBASE_HOST_ROOT:-./projects}:/workspace/projects:ro"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=2)"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    user: "10001:10001"
+    restart: unless-stopped
+
+volumes:
+  aurora_data:
+  postgres_data:

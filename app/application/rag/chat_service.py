@@ -18,8 +18,16 @@ def format_documents(documents: Any) -> str:
     )
 
 
-def build_rag_prompt(configuration: dict[str, str], context: str, question: str) -> str:
-    return configuration["rag.prompt"].format(context=context, question=question)
+def build_rag_prompt(
+    configuration: dict[str, str],
+    context: str,
+    question: str,
+    system_prompt: str | None = None,
+) -> str:
+    rag_prompt = configuration["rag.prompt"].format(context=context, question=question)
+    if not system_prompt or not system_prompt.strip():
+        return rag_prompt
+    return f"Session instructions:\n{system_prompt.strip()}\n\n{rag_prompt}"
 
 
 @dataclass
@@ -37,7 +45,7 @@ class ChatService:
         uow: UnitOfWork | None,
         *,
         vector_store_factory: Callable[[str], Any],
-        chat_model_factory: Callable[[str], Any],
+        chat_model_factory: Callable[..., Any],
     ) -> None:
         self._uow = uow
         self._create_vector_store = vector_store_factory
@@ -48,7 +56,14 @@ class ChatService:
         return await load_configuration(repository)
 
     async def prepare_chat(
-        self, messages: list[ChatMessage], requested_model: str | None
+        self,
+        messages: list[ChatMessage],
+        requested_model: str | None,
+        *,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
     ) -> ChatRun:
         configuration = await self.configuration()
         model_name = configuration["chat.model"]
@@ -57,13 +72,24 @@ class ChatService:
 
         question = messages[-1].content
         transcript = "\n".join(f"{m.role}: {m.content}" for m in messages)
-        prompt = await self._retrieve_prompt(configuration, question, transcript)
+        prompt = await self._retrieve_prompt(
+            configuration, question, transcript, system_prompt=system_prompt
+        )
+        generation_options = {
+            key: value
+            for key, value in {
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_tokens": max_tokens,
+            }.items()
+            if value is not None
+        }
         return ChatRun(
             completion_id=f"chatcmpl-{new_uuid7().hex}",
             created=int(time.time()),
             model_name=model_name,
             prompt=prompt,
-            chat_model=self._create_chat_model(model_name),
+            chat_model=self._create_chat_model(model_name, **generation_options),
         )
 
     async def answer_question(self, question: str) -> str:
@@ -81,7 +107,12 @@ class ChatService:
             yield str(token)
 
     async def _retrieve_prompt(
-        self, configuration: dict[str, str], question: str, transcript: str
+        self,
+        configuration: dict[str, str],
+        question: str,
+        transcript: str,
+        *,
+        system_prompt: str | None = None,
     ) -> str:
         vector_store = self._create_vector_store(configuration["embedding.model"])
         try:
@@ -93,7 +124,10 @@ class ChatService:
         except Exception as exc:
             raise ChatUnavailable("Chat retrieval is unavailable") from exc
         return build_rag_prompt(
-            configuration, format_documents(documents), transcript
+            configuration,
+            format_documents(documents),
+            transcript,
+            system_prompt=system_prompt,
         )
 
 

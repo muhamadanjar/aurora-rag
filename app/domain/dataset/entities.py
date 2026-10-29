@@ -34,12 +34,15 @@ class ExportStatus(str, Enum):
     expired = "expired"
 
 
+DatasetFormat = Literal["chatml", "alpaca"]
+
+
 @dataclass
 class Dataset:
     id: UUID
     title: str
     description: str | None
-    format_type: Literal["chatml"]
+    format_type: DatasetFormat
     version: int
     status: DatasetStatus
     created_by: UUID
@@ -77,7 +80,7 @@ class Revision:
     example_id: UUID
     revision_number: int
     version: int
-    content: list[dict[str, Any]]
+    content: Any
     system_prompt: str | None
     schema_version: str
     validation_status: RevisionState
@@ -119,7 +122,7 @@ class Export:
 
 @dataclass
 class NewRevision:
-    content: list[dict[str, Any]]
+    content: Any
     system_prompt: str | None = None
     schema_version: str = "1"
 

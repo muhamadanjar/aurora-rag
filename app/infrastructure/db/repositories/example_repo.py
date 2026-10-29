@@ -3,11 +3,14 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain.dataset.entities import Example
+from app.domain.dataset.entities import Example, Revision
 from app.domain.dataset.repositories import ExampleRepository
-from app.infrastructure.db.mappers import apply_example, example_to_domain
-from app.infrastructure.db.models import ExampleStatus as OrmExampleStatus
-from app.infrastructure.db.models import TrainingExample
+from app.infrastructure.db.mappers import apply_example, example_to_domain, revision_to_domain
+from app.infrastructure.db.models import (
+    ExampleStatus as OrmExampleStatus,
+    TrainingExample,
+    TrainingExampleRevision,
+)
 
 
 class SqlExampleRepository(ExampleRepository):
@@ -40,15 +43,22 @@ class SqlExampleRepository(ExampleRepository):
 
     async def list_by_dataset(
         self, dataset_id: UUID, *, offset: int, limit: int
-    ) -> list[Example]:
+    ) -> list[tuple[Example, Revision | None]]:
         result = await self._session.execute(
-            select(TrainingExample)
+            select(TrainingExample, TrainingExampleRevision)
+            .outerjoin(
+                TrainingExampleRevision,
+                TrainingExampleRevision.id == TrainingExample.current_revision_id,
+            )
             .where(TrainingExample.dataset_id == dataset_id)
-            .order_by(TrainingExample.created_at)
+            .order_by(TrainingExample.created_at, TrainingExample.id)
             .offset(offset)
             .limit(limit)
         )
-        return [example_to_domain(row) for row in result.scalars()]
+        return [
+            (example_to_domain(example), revision_to_domain(revision) if revision else None)
+            for example, revision in result.all()
+        ]
 
     async def save(self, example: Example) -> None:
         row = await self._session.get(TrainingExample, example.id)

@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 class DatasetCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     description: Optional[str] = None
-    format_type: Literal["chatml"] = "chatml"
+    format_type: Literal["chatml", "alpaca"] = "chatml"
 
     @field_validator("title")
     @classmethod
@@ -35,16 +35,15 @@ class DatasetUpdate(BaseModel):
 
 
 class ExampleCreate(BaseModel):
-    content: list[dict[str, Any]]
+    content: Any
     system_prompt: Optional[str] = None
     schema_version: str = Field(default="1", min_length=1, max_length=32)
 
 
 class RevisionCreate(BaseModel):
-    content: list[dict[str, Any]]
+    content: Any
     system_prompt: Optional[str] = None
     schema_version: str = Field(default="1", min_length=1, max_length=32)
-
 
 class ReviewRequest(BaseModel):
     approved: bool

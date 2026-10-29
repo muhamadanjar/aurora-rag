@@ -1,12 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.application.rag.chat_service import ChatService, IngestService
-from app.delivery.dependencies import get_optional_uow
+from app.delivery.dependencies import get_optional_uow, require_rag_token
 from app.delivery.schemas.rag import IngestRequest, QueryRequest, QueryResponse
 from app.domain.unit_of_work import UnitOfWork
 from app.infrastructure.rag.vector_store import create_chat_model, create_vector_store
 
-router = APIRouter(tags=["rag"])
+router = APIRouter(tags=["rag"], dependencies=[Depends(require_rag_token)])
 
 
 @router.post("/ingest", summary="Simpan potongan kode ke Vector DB")
