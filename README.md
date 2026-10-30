@@ -64,22 +64,7 @@ Files over 1 MiB are skipped. A scan fails without publishing if it exceeds 128 
 | `GET /codebase/projects` | List indexed project IDs and the `legacy` scope. |
 | `POST /codebase/search` | Search one scope. Body: `{"project_id":"my-project","query":"...","limit":10}`. |
 
-Configure a coding agent to launch the MCP server over stdio. Substitute the absolute Aurora RAG directory and the same bearer token; never commit a real token to project configuration:
-
-```json
-{
-  "mcpServers": {
-    "aurora-rag": {
-      "command": "uv",
-      "args": ["--directory", "/absolute/path/to/aurora-rag", "run", "python", "-m", "codebase_mcp.server"],
-      "env": {
-        "AURORA_RAG_URL": "http://127.0.0.1:8000",
-        "AURORA_CODEBASE_TOKEN": "<same-token-as-api>"
-      }
-    }
-  }
-}
-```
+For setup instructions for Codex, OMP, Pi, and Claude Code—including token handling, client-specific configuration, verification, and troubleshooting—see [MCP client setup](docs/mcp-clients.md).
 
 The MCP tools are `list_projects` and `search_codebase`. Search requires an explicit project ID or `legacy` and returns source snippets rather than generated answers. The MCP server does not index or delete projects. Project indexing and retrieval use the runtime `embedding.model`; changing that model is blocked while indexed vectors exist.
 
@@ -106,15 +91,29 @@ Create `.env.docker` and set the required database, authentication, and operator
 ```bash
 cp .env.example .env.docker
 # Edit .env.docker and set required values, including POSTGRES_PASSWORD.
-docker compose --env-file .env.docker config
-docker compose --env-file .env.docker up -d --build --force-recreate api
-docker compose --env-file .env.docker ps
-curl --fail http://127.0.0.1:8007/openapi.json
+make help
+make config
+make up
+make ps
+make health
 ```
 
 Compose runs database migrations before starting the API. PostgreSQL data and Chroma/index/export files persist in named volumes `postgres_data` and `aurora_data`; `docker compose down` preserves them. Avoid `docker compose down -v` unless you intend to delete both data volumes.
 
-The API binds to `127.0.0.1` on port `8007` by default; set `AURORA_PORT` to change it. Ollama is expected on the Docker host at `OLLAMA_HOST` (default `http://host.docker.internal:11434`); configure the host Ollama service to accept connections from Docker. Set `AURORA_CODEBASE_HOST_ROOT` to the host directory containing projects to index. Compose mounts it read-only at `/workspace/projects`; codebase index requests must use paths such as `/workspace/projects/my-project`.
+The API binds to `127.0.0.1` on port `8007` by default; set `AURORA_PORT` to change it. Ollama is expected on the Docker host at `OLLAMA_HOST` (default `http://host.docker.internal:11434`); configure the host Ollama service to accept connections from Docker. The default Docker setup mounts the single host directory `AURORA_CODEBASE_HOST_ROOT` read-only at `/workspace/projects`.
+
+For multiple separate host folders, run `make multi-root` to copy `compose.codebase-roots.example.yaml` to the ignored local file `compose.codebase-roots.yaml`. Replace each bind-mount `source` with a real host directory and keep every `target` listed in `AURORA_CODEBASE_ROOTS`. Add one `volumes` entry and its target to the colon-separated roots value per additional folder. The Makefile automatically includes this local override for every Compose target while it exists. The example retains `/workspace/projects` and adds `/workspace/codebases/project-a` and `/workspace/codebases/project-b`. Host folders must be readable by the API's container UID `10001`.
+
+Validate and start the API with the override:
+
+```bash
+make multi-root
+# Edit compose.codebase-roots.yaml; replace the example host paths first.
+make config
+make up
+```
+
+Index using paths inside the container, not host paths—for example `/workspace/codebases/project-a` and `/workspace/codebases/project-b`. `AURORA_CODEBASE_ROOTS` is the API's allowlist of container paths; Compose bind mounts make those host folders available there.
 
 The API container runs as UID `10001`, with a read-only root filesystem and no Linux capabilities. Its published port is limited to localhost. PostgreSQL is internal to the Compose network and is not published.
 

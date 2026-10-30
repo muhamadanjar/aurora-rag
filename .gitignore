@@ -4,6 +4,7 @@ env
 .env.*
 !.env.example
 .env.docker
+compose.codebase-roots.yaml
 __pycache__
 logs/*
 data/
