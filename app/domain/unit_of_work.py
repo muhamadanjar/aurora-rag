@@ -10,6 +10,7 @@ from app.domain.rag.repositories import ConfigurationRepository
 
 
 class UnitOfWork(Protocol):
+    session: object
     datasets: DatasetRepository
     examples: ExampleRepository
     revisions: RevisionRepository

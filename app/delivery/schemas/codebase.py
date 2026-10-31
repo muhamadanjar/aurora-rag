@@ -1,4 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field
+from datetime import datetime
+from uuid import UUID
 
 
 class CodebaseIndexRequest(BaseModel):
@@ -31,3 +33,34 @@ class CodebaseProject(BaseModel):
 
 class CodebaseProjectListResponse(BaseModel):
     projects: list[CodebaseProject]
+
+
+class IndexJobProgress(BaseModel):
+    processed_chunks: int
+    total_chunks: int | None
+    skipped_files: int
+
+
+class IndexJobError(BaseModel):
+    code: str
+    message: str
+
+
+class IndexJobResponse(BaseModel):
+    job_id: UUID
+    project_id: str
+    status: str
+    stage: str | None
+    progress: IndexJobProgress
+    result: dict[str, int] | None
+    error: IndexJobError | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class IndexJobAccepted(BaseModel):
+    job_id: UUID
+    project_id: str
+    status: str
+    status_url: str

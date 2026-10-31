@@ -13,3 +13,15 @@ services:
         source: /srv/project-b
         target: /workspace/codebases/project-b
         read_only: true
+  worker:
+    environment:
+      AURORA_CODEBASE_ROOTS: "/workspace/projects:/workspace/codebases/project-a:/workspace/codebases/project-b"
+    volumes:
+      - type: bind
+        source: /absolute/path/to/project-a
+        target: /workspace/codebases/project-a
+        read_only: true
+      - type: bind
+        source: /srv/project-b
+        target: /workspace/codebases/project-b
+        read_only: true

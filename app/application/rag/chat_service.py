@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import secrets
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -9,6 +11,8 @@ from app.domain.rag.entities import ChatMessage
 from app.domain.unit_of_work import UnitOfWork
 
 from .config_service import load_configuration
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def format_documents(documents: Any) -> str:
@@ -144,13 +148,26 @@ class IngestService:
     async def ingest(
         self, *, code_content: str, file_path: str, language: str
     ) -> None:
-        repository = self._uow.configurations if self._uow is not None else None
-        if repository is not None:
-            await repository.get("embedding.model", for_update=True)
-        configuration = await load_configuration(repository)
-        vector_store = self._create_vector_store(configuration["embedding.model"])
-        await asyncio.to_thread(
-            vector_store.add_texts,
-            texts=[code_content],
-            metadatas=[{"source": file_path, "language": language}],
-        )
+        operation = secrets.token_hex(8)
+        stage = "configuration"
+        logger.info("ingest operation=%s stage=%s started", operation, stage)
+        try:
+            repository = self._uow.configurations if self._uow is not None else None
+            if repository is not None:
+                await repository.get("embedding.model", for_update=True)
+            configuration = await load_configuration(repository)
+            stage = "vector_store"
+            logger.info("ingest operation=%s stage=%s started", operation, stage)
+            vector_store = self._create_vector_store(configuration["embedding.model"])
+            stage = "embedding_and_storage"
+            logger.info("ingest operation=%s stage=%s started", operation, stage)
+            await asyncio.to_thread(
+                vector_store.add_texts,
+                texts=[code_content],
+                metadatas=[{"source": file_path, "language": language}],
+            )
+        except Exception as exc:
+            logger.error("ingest operation=%s stage=%s failed error_type=%s",
+                         operation, stage, type(exc).__name__)
+            raise
+        logger.info("ingest operation=%s completed", operation)

@@ -1,5 +1,7 @@
 # Panduan memasukkan dokumen dan proyek ke Aurora RAG
 
+Indexing codebase adalah job durable di PostgreSQL. Endpoint submit segera mengembalikan `202` dan `job_id`; worker melakukan scan, embedding, dan publication. Poll `GET /codebase/index-jobs/{job_id}`. Progress bertambah setelah batch Chroma berhasil disimpan, error hanya memakai kategori aman, dan generasi lama tetap tersedia jika job gagal. Tidak ada retry atau cancellation otomatis.
+
 Panduan ini menjelaskan dua jalur ingestion Aurora. Pilih jalur berdasarkan cara Anda ingin mencari konten:
 
 | Kebutuhan | Endpoint | Chroma collection | Cara mengambil hasil |
@@ -58,7 +60,13 @@ Jalankan API:
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Biarkan proses ini berjalan. Perintah `curl` di bawah harus dijalankan di shell yang memiliki nilai token yang sama. Untuk mengakses API dari jaringan lain, gunakan TLS dan konfigurasi jaringan yang sesuai; jangan mengekspos server development begitu saja.
+Jalankan worker durable di terminal kedua dari working directory yang sama:
+
+```bash
+uv run python -m app.worker
+```
+
+Biarkan kedua proses ini berjalan. Perintah `curl` di bawah harus dijalankan di shell yang memiliki nilai token yang sama. Untuk mengakses API dari jaringan lain, gunakan TLS dan konfigurasi jaringan yang sesuai; jangan mengekspos server development begitu saja.
 
 ## 3. Jalur A — masukkan dokumen atau teks ke RAG chat
 
@@ -154,15 +162,23 @@ Path request harus absolut dan berada di root yang diizinkan:
 {"path":"/home/user/projects/sample-service"}
 ```
 
-Respons merangkum jumlah chunk dan file yang dilewati, misalnya:
+Respons hanya menerima job dan mengembalikan URL status, misalnya:
 
 ```json
 {
+  "job_id": "01900000-0000-7000-8000-000000000001",
   "project_id": "sample-service",
-  "indexed_chunks": 42,
-  "skipped_files": 1,
-  "skipped_paths": ["large-data.txt"]
+  "status": "queued",
+  "status_url": "/codebase/index-jobs/01900000-0000-7000-8000-000000000001"
 }
+```
+
+Salin `job_id` dari respons ke variabel `JOB_ID`, lalu ambil status sampai `succeeded` atau `failed`:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  "$API_URL/codebase/index-jobs/$JOB_ID" \
+  -H "Authorization: Bearer $AURORA_CODEBASE_TOKEN"
 ```
 
 Pemindaian mengikuti `.gitignore`, tidak mengikuti symbolic link, dan melewati file biner serta nama file yang diketahui mengandung secret. File teks dipecah menjadi chunk 80 baris dengan overlap 10 baris. File di atas 1 MiB dilewati. Batas total satu scan: 128 MiB, 10.000 file, 50.000 chunk, 100.000 entry direktori, kedalaman 64 direktori, dan 60 detik. Pemfilteran nama file tidak dapat menemukan secret yang tertanam di file sumber biasa; tinjau proyek sebelum mengindeksnya.
@@ -234,6 +250,12 @@ MCP menyediakan `list_projects` dan `search_codebase`; ia mengirim request ke en
 
 Jangan commit token asli ke file konfigurasi MCP. Ikuti panduan konfigurasi coding agent yang dipakai untuk menentukan cara menyediakan secret dengan aman.
 
+## Log ingestion dan indexing
+
+Pada Docker Compose, gunakan `make logs` untuk log API dan `make worker` untuk log worker indexing. Log `ingest` dan `codebase_index` menampilkan ID operasi, tahap yang sedang berjalan, dan tipe exception jika gagal; log indexing juga mencantumkan ID job. Tahap index meliputi scan dan chunking, pembuatan collection, embedding per batch, penyimpanan batch, serta publikasi.
+
+Log tidak menyertakan isi dokumen, path, token, pesan exception, atau traceback, karena dapat mengandung data sensitif. `embedding_and_storage` pada `/ingest` mencakup embedding dan penyimpanan sekaligus; tahap ini tidak membedakan kegagalan keduanya. Kesalahan validasi atau autentikasi yang ditolak sebelum handler tidak menghasilkan log tahapan ini.
+
 ## 5. Error umum
 
 | Status | Penyebab umum | Tindakan |
@@ -241,9 +263,10 @@ Jangan commit token asli ke file konfigurasi MCP. Ikuti panduan konfigurasi codi
 | `401` | Bearer token hilang atau tidak cocok | Pastikan memakai token yang benar untuk endpoint: `AURORA_RAG_TOKEN` untuk `/ingest` dan `/query`, `AURORA_CODEBASE_TOKEN` untuk `/codebase/*`. |
 | `503` | Token endpoint tersebut belum tersedia di environment proses API | Export token sebelum memulai ulang API. |
 | `413` pada index/search proyek | Body request codebase melebihi 1 MiB | Kirim path dan parameter ringkas; jangan mengirim isi seluruh proyek di body. |
-| `422` saat mengindeks | ID/path tidak valid, path di luar root, scan melampaui batas, atau file/aturan ignore bermasalah | Periksa `AURORA_CODEBASE_ROOTS`, path absolut, `.gitignore`, ukuran, dan daftar `skipped_paths`. |
-| `409` saat index/delete | Operasi proyek yang sama masih berjalan | Tunggu operasi saat ini selesai, lalu coba lagi. |
-| `502` pada operasi codebase | Embedding/model atau operasi index/search gagal | Pastikan Ollama berjalan dan `embedding.model` tersedia; periksa log API. |
+| `422` saat submit | ID/path tidak valid atau path di luar root | Periksa `AURORA_CODEBASE_ROOTS`, path absolut, dan ID proyek. Error scan setelah submit tercatat pada status job. |
+| `409` saat index/delete | Job atau operasi proyek yang sama masih aktif | Tunggu operasi saat ini selesai, lalu coba lagi. |
+| Job `failed` pada embedding | Layanan embedding tidak dapat dihubungi atau gagal | Pastikan worker dapat mengakses Ollama dan model tersedia; periksa log worker, lalu submit job baru. |
+| `502` saat search | Embedding/model atau pencarian gagal | Periksa Ollama dan log API. |
 | Jawaban RAG tidak menggunakan konten baru | Konten masuk ke jalur/collection yang berbeda, token/model salah, atau retrieval tidak mengambil dokumen tersebut | Pastikan `/ingest` dipakai untuk `source_code`; gunakan `/codebase/search` untuk proyek yang diindeks dengan `project_id` biasa. Periksa nilai `embedding.model` serta Ollama. |
 
 `/ingest` dan `/query` menggunakan collection `source_code` dan token RAG. Hanya API codebase yang memiliki operasi delete proyek; `/ingest` tidak menyediakan daftar maupun penghapusan dokumen individual. Jangan mengedit direktori Chroma secara manual.

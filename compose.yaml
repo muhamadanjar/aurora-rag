@@ -47,6 +47,31 @@ services:
     user: "10001:10001"
     restart: unless-stopped
 
+  worker:
+    build:
+      context: .
+    image: aurora-rag:local
+    env_file: *aurora-env-file
+    environment:
+      <<: *aurora-environment
+      OLLAMA_HOST: "${OLLAMA_HOST:-http://host.docker.internal:11434}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - aurora_data:/app/data
+      - "${AURORA_CODEBASE_HOST_ROOT:-./projects}:/workspace/projects:ro"
+    command: ["python", "-m", "app.worker"]
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    user: "10001:10001"
+    restart: unless-stopped
+
 volumes:
   aurora_data:
   postgres_data:

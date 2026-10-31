@@ -4,13 +4,20 @@ import threading
 
 import pytest
 import pytest_asyncio
+from alembic import command
+from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
+from pathlib import Path
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import get_codebase_settings
-from app.delivery.dependencies import get_optional_uow
+from app.core.config import get_settings
+from app.infrastructure.db import connection as db
 from app.infrastructure.codebase import index_store
 from app.infrastructure.codebase.index_store import CodebaseIndexStore, ProjectBusy
+from app.infrastructure.codebase.jobs import claim_job
 from app.main import app
+from app.worker import execute_job
 
 
 class FakeEmbeddings:
@@ -22,6 +29,11 @@ class FakeEmbeddings:
 
     def embed_query(self, text):
         return self.embed_documents([text])[0]
+
+
+@pytest.fixture
+def database_url():
+    return os.environ["TEST_DATABASE_URL"]
 
 
 @pytest.fixture
@@ -38,13 +50,66 @@ def codebase_env(tmp_path, monkeypatch):
 
 
 @pytest_asyncio.fixture
-async def codebase_client(codebase_env, monkeypatch):
-    async def no_uow():
-        yield None
+async def codebase_client(codebase_env, database_url, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("AUTH_USERNAME", "operator")
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", "$2b$12$C6UzMDM.H6dfI/f/IKcEe.7Wj8Wc1Tz5g8nB6yZ6Y1Q8ZQ8Q8Q8Q8")
+    monkeypatch.setenv("JWT_SECRET", "test-secret-012345678901234567890123456789")
+    monkeypatch.setenv("OPERATOR_UUID", "00000000-0000-0000-0000-000000000001")
+    get_settings.cache_clear()
+    db.engine.cache_clear()
+    db.session_factory.cache_clear()
 
-    monkeypatch.setitem(app.dependency_overrides, get_optional_uow, no_uow)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        yield client
+    alembic_config = Config(str(Path(__file__).parents[1] / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(Path(__file__).parents[1] / "alembic"))
+    await asyncio.to_thread(command.downgrade, alembic_config, "base")
+    await asyncio.to_thread(command.upgrade, alembic_config, "head")
+
+    worker_engine = create_async_engine(database_url)
+    previous_session_local = db.SessionLocal
+    db.SessionLocal = async_sessionmaker(worker_engine, expire_on_commit=False, class_=db.AsyncSession)
+
+    async def run_one_job():
+        lease = await claim_job(worker_engine.connect)
+        assert lease is not None
+        await execute_job(lease)
+
+    class JobAwareClient:
+        def __init__(self, client):
+            self._client = client
+
+        async def post(self, url, *args, **kwargs):
+            response = await self._client.post(url, *args, **kwargs)
+            if response.status_code == 202 and url.endswith("/index"):
+                await run_one_job()
+            return response
+
+        def __getattr__(self, name):
+            return getattr(self._client, name)
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            yield JobAwareClient(client)
+    finally:
+        db.SessionLocal = previous_session_local
+        await worker_engine.dispose()
+        db.engine.cache_clear()
+        db.session_factory.cache_clear()
+        get_settings.cache_clear()
+
+
+async def index_status(client, response, token="codebase-test-token"):
+    assert response.status_code == 202
+    status = await client.get(response.headers["location"],
+                              headers={"Authorization": f"Bearer {token}"})
+    assert status.status_code == 200
+    return status.json()
+
+
+async def assert_index_succeeded(client, response, token="codebase-test-token"):
+    payload = await index_status(client, response, token=token)
+    assert payload["status"] == "succeeded"
+    return payload
 
 
 @pytest.mark.asyncio
@@ -98,8 +163,8 @@ async def test_index_scans_safe_text_with_nested_gitignore_and_line_metadata(cod
     headers = {"Authorization": "Bearer codebase-test-token"}
 
     response = await codebase_client.post("/codebase/projects/demo/index", headers=headers, json={"path": str(root)})
-    assert response.status_code == 200
-    assert response.json()["indexed_chunks"] == 2
+    payload = await assert_index_succeeded(codebase_client, response)
+    assert payload["result"]["indexed_chunks"] == 2
     results = await codebase_client.post("/codebase/search", headers=headers,
                                          json={"project_id": "demo", "query": "alpha", "limit": 5})
     assert results.status_code == 200
@@ -120,10 +185,10 @@ async def test_reindex_removes_stale_chunks_and_failed_build_keeps_published_gen
     source = root / "one.py"
     source.write_text("old marker", encoding="utf-8")
     headers = {"Authorization": "Bearer codebase-test-token"}
-    assert (await codebase_client.post("/codebase/projects/demo/index", headers=headers, json={"path": str(root)})).status_code == 200
+    assert (await codebase_client.post("/codebase/projects/demo/index", headers=headers, json={"path": str(root)})).status_code == 202
     source.unlink()
     (root / "two.py").write_text("new marker", encoding="utf-8")
-    assert (await codebase_client.post("/codebase/projects/demo/index", headers=headers, json={"path": str(root)})).status_code == 200
+    assert (await codebase_client.post("/codebase/projects/demo/index", headers=headers, json={"path": str(root)})).status_code == 202
     results = await codebase_client.post("/codebase/search", headers=headers,
                                          json={"project_id": "demo", "query": "new", "limit": 5})
     assert all("old marker" not in item["content"] for item in results.json()["results"])
@@ -132,7 +197,8 @@ async def test_reindex_removes_stale_chunks_and_failed_build_keeps_published_gen
     monkeypatch.setattr(index_store.OllamaEmbeddings, "embed_documents",
                         lambda *args: (_ for _ in ()).throw(RuntimeError("ollama down")))
     failed = await codebase_client.post("/codebase/projects/demo/index", headers=headers, json={"path": str(root)})
-    assert failed.status_code == 502
+    failed_payload = await index_status(codebase_client, failed)
+    assert failed_payload["status"] == "failed"
     monkeypatch.setattr(index_store.OllamaEmbeddings, "embed_documents", original_embed)
     preserved = await codebase_client.post("/codebase/search", headers=headers,
                                            json={"project_id": "demo", "query": "new", "limit": 5})
@@ -165,7 +231,7 @@ async def test_same_project_http_indexes_conflict_without_blocking_event_loop(co
                                         json={"path": str(root)})
     release.set()
     first_response = await first
-    assert first_response.status_code == 200
+    assert first_response.status_code == 202
     assert second.status_code == 409
 
 
@@ -178,7 +244,7 @@ async def test_search_reads_old_generation_during_paused_reindex_then_new_genera
     headers = {"Authorization": "Bearer codebase-test-token"}
     initial = await codebase_client.post("/codebase/projects/snapshot/index", headers=headers,
                                          json={"path": str(root)})
-    assert initial.status_code == 200
+    assert initial.status_code == 202
 
     source.write_text("new generation", encoding="utf-8")
     started = threading.Event()
@@ -203,7 +269,7 @@ async def test_search_reads_old_generation_during_paused_reindex_then_new_genera
 
     release.set()
     published = await reindex
-    assert published.status_code == 200
+    assert published.status_code == 202
     new_search = await codebase_client.post("/codebase/search", headers=headers,
                                             json={"project_id": "snapshot", "query": "new generation", "limit": 5})
     assert new_search.status_code == 200
@@ -219,7 +285,7 @@ async def test_search_cleanup_and_publish_are_serialized(codebase_client, codeba
     headers = {"Authorization": "Bearer codebase-test-token"}
     initial = await codebase_client.post("/codebase/projects/publication-race/index", headers=headers,
                                          json={"path": str(root)})
-    assert initial.status_code == 200
+    assert initial.status_code == 202
     source.write_text("new snapshot", encoding="utf-8")
 
     cleanup_entered = threading.Event()
@@ -242,7 +308,7 @@ async def test_search_cleanup_and_publish_are_serialized(codebase_client, codeba
         await asyncio.wait_for(asyncio.shield(reindex), timeout=0.05)
     release_cleanup.set()
     assert (await search).status_code == 200
-    assert (await reindex).status_code == 200
+    assert (await reindex).status_code == 202
     current = await codebase_client.post("/codebase/search", headers=headers,
                                          json={"project_id": "publication-race", "query": "new", "limit": 5})
     assert any("new snapshot" in item["content"] for item in current.json()["results"])
@@ -284,7 +350,9 @@ async def test_direct_hard_excluded_and_ignored_ancestor_paths_are_rejected(code
     secrets.mkdir(parents=True)
     direct = await codebase_client.post("/codebase/projects/direct-secrets/index", headers=headers,
                                         json={"path": str(secrets)})
-    assert direct.status_code == 422
+    direct_payload = await index_status(codebase_client, direct)
+    assert direct_payload["status"] == "failed"
+    assert direct_payload["error"]["code"] == "invalid_source"
 
     ignored_root = codebase_env / "roots" / "ignored-ancestor"
     ignored = ignored_root / "private"
@@ -292,7 +360,9 @@ async def test_direct_hard_excluded_and_ignored_ancestor_paths_are_rejected(code
     (ignored_root / ".gitignore").write_text("private/\n", encoding="utf-8")
     ancestor = await codebase_client.post("/codebase/projects/ignored-ancestor/index", headers=headers,
                                           json={"path": str(ignored)})
-    assert ancestor.status_code == 422
+    ancestor_payload = await index_status(codebase_client, ancestor)
+    assert ancestor_payload["status"] == "failed"
+    assert ancestor_payload["error"]["code"] == "invalid_source"
 
 
 @pytest.mark.asyncio
@@ -305,14 +375,14 @@ async def test_ignore_file_limits_and_special_files_fail_closed(codebase_client,
     (oversized / ".gitignore").write_text("x\n" * (MAX_GITIGNORE_RULES + 1), encoding="utf-8")
     too_many_rules = await codebase_client.post("/codebase/projects/oversized/index", headers=headers,
                                                 json={"path": str(oversized)})
-    assert too_many_rules.status_code == 422
+    assert (await index_status(codebase_client, too_many_rules))["status"] == "failed"
 
     too_large = codebase_env / "roots" / "too-large"
     too_large.mkdir()
     (too_large / ".gitignore").write_bytes(b"x" * (MAX_GITIGNORE_BYTES + 1))
     too_large_response = await codebase_client.post("/codebase/projects/too-large/index", headers=headers,
                                                     json={"path": str(too_large)})
-    assert too_large_response.status_code == 422
+    assert (await index_status(codebase_client, too_large_response))["status"] == "failed"
 
     special = codebase_env / "roots" / "special"
     special.mkdir()
@@ -320,7 +390,7 @@ async def test_ignore_file_limits_and_special_files_fail_closed(codebase_client,
         os.mkfifo(special / "input.py")
         fifo_response = await codebase_client.post("/codebase/projects/special/index", headers=headers,
                                                    json={"path": str(special)})
-        assert fifo_response.status_code == 422
+        assert (await index_status(codebase_client, fifo_response))["status"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -331,13 +401,13 @@ async def test_aggregate_limits_fail_and_preserve_previous_generation(codebase_c
     source.write_text("previous", encoding="utf-8")
     headers = {"Authorization": "Bearer codebase-test-token"}
     assert (await codebase_client.post("/codebase/projects/limits/index", headers=headers,
-                                       json={"path": str(root)})).status_code == 200
+                                       json={"path": str(root)})).status_code == 202
 
     monkeypatch.setattr(index_store, "MAX_REPOSITORY_BYTES", 1)
     source.write_text("replacement", encoding="utf-8")
     limited = await codebase_client.post("/codebase/projects/limits/index", headers=headers,
                                          json={"path": str(root)})
-    assert limited.status_code == 422
+    assert (await index_status(codebase_client, limited))["status"] == "failed"
     preserved = await codebase_client.post("/codebase/search", headers=headers,
                                            json={"project_id": "limits", "query": "previous", "limit": 5})
     assert any("previous" in item["content"] for item in preserved.json()["results"])
@@ -346,12 +416,12 @@ async def test_aggregate_limits_fail_and_preserve_previous_generation(codebase_c
     monkeypatch.setattr(index_store, "MAX_REPOSITORY_FILES", 0)
     file_limited = await codebase_client.post("/codebase/projects/limits/index", headers=headers,
                                               json={"path": str(root)})
-    assert file_limited.status_code == 422
+    assert (await index_status(codebase_client, file_limited))["status"] == "failed"
     monkeypatch.setattr(index_store, "MAX_REPOSITORY_FILES", 10_000)
     monkeypatch.setattr(index_store, "MAX_REPOSITORY_CHUNKS", 0)
     chunk_limited = await codebase_client.post("/codebase/projects/limits/index", headers=headers,
                                                json={"path": str(root)})
-    assert chunk_limited.status_code == 422
+    assert (await index_status(codebase_client, chunk_limited))["status"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -371,7 +441,8 @@ async def test_embedding_and_chroma_batches_are_bounded(codebase_client, codebas
     response = await codebase_client.post("/codebase/projects/batching/index",
                                          headers={"Authorization": "Bearer codebase-test-token"},
                                          json={"path": str(root)})
-    assert response.status_code == 200
+    assert response.status_code == 202
+    assert (await index_status(codebase_client, response))["status"] == "succeeded"
     assert batches == [128, 2]
 
 
@@ -387,12 +458,12 @@ async def test_scan_pattern_deadline_and_enumeration_budgets_fail_closed(codebas
     monkeypatch.setattr(index_store, "MAX_TOTAL_GITIGNORE_RULES", 1)
     response = await codebase_client.post("/codebase/projects/aggregate-rules/index", headers=headers,
                                           json={"path": str(aggregate_rules)})
-    assert response.status_code == 422
+    assert (await index_status(codebase_client, response))["status"] == "failed"
     monkeypatch.setattr(index_store, "MAX_TOTAL_GITIGNORE_RULES", 50_000)
     monkeypatch.setattr(index_store, "MAX_TOTAL_GITIGNORE_BYTES", 1)
     response = await codebase_client.post("/codebase/projects/aggregate-rules-bytes/index", headers=headers,
                                           json={"path": str(aggregate_rules)})
-    assert response.status_code == 422
+    assert (await index_status(codebase_client, response))["status"] == "failed"
     monkeypatch.setattr(index_store, "MAX_TOTAL_GITIGNORE_BYTES", 8 * 1024 * 1024)
 
     visited = codebase_env / "roots" / "visited-budget"
@@ -402,7 +473,7 @@ async def test_scan_pattern_deadline_and_enumeration_budgets_fail_closed(codebas
     monkeypatch.setattr(index_store, "MAX_VISITED_ENTRIES", 1)
     response = await codebase_client.post("/codebase/projects/visited-budget/index", headers=headers,
                                           json={"path": str(visited)})
-    assert response.status_code == 422
+    assert (await index_status(codebase_client, response))["status"] == "failed"
 
     depth = codebase_env / "roots" / "depth-budget" / "one" / "two"
     depth.mkdir(parents=True)
@@ -411,7 +482,7 @@ async def test_scan_pattern_deadline_and_enumeration_budgets_fail_closed(codebas
     monkeypatch.setattr(index_store, "MAX_DIRECTORY_DEPTH", 1)
     response = await codebase_client.post("/codebase/projects/depth-budget/index", headers=headers,
                                           json={"path": str(codebase_env / "roots" / "depth-budget")})
-    assert response.status_code == 422
+    assert (await index_status(codebase_client, response))["status"] == "failed"
 
     deadline = codebase_env / "roots" / "deadline-budget"
     deadline.mkdir()
@@ -420,7 +491,7 @@ async def test_scan_pattern_deadline_and_enumeration_budgets_fail_closed(codebas
     monkeypatch.setattr(index_store, "MAX_SCAN_SECONDS", 0)
     response = await codebase_client.post("/codebase/projects/deadline-budget/index", headers=headers,
                                           json={"path": str(deadline)})
-    assert response.status_code == 422
+    assert (await index_status(codebase_client, response))["status"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -438,7 +509,7 @@ async def test_gitignore_regex_timeout_fails_as_scan_error(codebase_client, code
     response = await codebase_client.post("/codebase/projects/regex-timeout/index",
                                           headers={"Authorization": "Bearer codebase-test-token"},
                                           json={"path": str(root)})
-    assert response.status_code == 422
+    assert (await index_status(codebase_client, response))["status"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -465,8 +536,8 @@ async def test_directory_only_ignore_skips_unreadable_special_children(codebase_
         headers={"Authorization": "Bearer codebase-test-token"},
         json={"path": str(root)},
     )
-    assert response.status_code == 200
-    assert response.json()["indexed_chunks"] == 1
+    payload = await assert_index_succeeded(codebase_client, response)
+    assert payload["result"]["indexed_chunks"] == 1
 
 
 
@@ -511,8 +582,8 @@ async def test_codebase_endpoint_loads_token_and_roots_from_dotenv(codebase_clie
         json={"path": str(root)},
     )
 
-    assert response.status_code == 200
-    assert response.json()["indexed_chunks"] == 1
+    payload = await assert_index_succeeded(codebase_client, response, token="dotenv-token")
+    assert payload["result"]["indexed_chunks"] == 1
 
 
 @pytest.mark.asyncio
@@ -528,5 +599,5 @@ async def test_index_accepts_repository_over_previous_64_mib_limit(codebase_clie
         json={"path": str(root)},
     )
 
-    assert response.status_code == 200
-    assert response.json()["skipped_files"] == 1
+    payload = await assert_index_succeeded(codebase_client, response)
+    assert payload["result"]["skipped_files"] == 1

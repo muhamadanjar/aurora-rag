@@ -42,6 +42,8 @@ export AURORA_RAG_TOKEN='<different-strong-random-secret>'
 export AURORA_CODEBASE_TOKEN='<another-strong-random-secret>'
 export AURORA_CODEBASE_ROOTS='/absolute/path/to/projects'
 uvicorn app.main:app --host 127.0.0.1
+# In a second terminal, from the same working directory:
+python -m app.worker
 ```
 
 With Ollama running and the configured embedding model installed, index a project under an allowed root:
@@ -53,13 +55,14 @@ curl --fail-with-body -X POST 'http://127.0.0.1:8000/codebase/projects/my-projec
   -d '{"path":"/absolute/path/to/projects/my-project"}'
 ```
 
-Indexing is synchronous. A successful re-index publishes a new generation and removes stale source results; failures preserve the published generation. Source paths in project results are relative to the indexed directory, with line ranges. The scanner honors `.gitignore` and excludes symbolic links, known secret files, binary files, dependencies and build output. Large files are skipped and reported in the response. Filename exclusions do not detect secrets embedded in otherwise allowed source files; review a project before indexing it.
+The request returns `202` with a durable PostgreSQL job ID. Poll `GET /codebase/index-jobs/{job_id}` for stage, progress, result, or a sanitized error. A successful re-index publishes a new generation and removes stale source results; failures preserve the published generation. Terminal jobs are retained for 30 days; retry by submitting a new job. Source paths in project results are relative to the indexed directory, with line ranges. The scanner honors `.gitignore` and excludes symbolic links, known secret files, binary files, dependencies and build output. Large files are skipped and reported in job progress. Filename exclusions do not detect secrets embedded in otherwise allowed source files; review a project before indexing it.
 
 Files over 1 MiB are skipped. A scan fails without publishing if it exceeds 128 MiB in aggregate, 10,000 files, 50,000 chunks, 100,000 directory entries, 64 directory levels, or 60 seconds. Each `.gitignore` is limited to 1 MiB and 10,000 rules; aggregate ignore data is limited to 8 MiB and 50,000 rules. Individual ignore-pattern matches are limited to 50 ms. Embeddings are inserted in batches of 128. An index or delete already in progress for a project returns `409`; reads continue against the previously published generation during a re-index.
 
 | Method and path | Purpose |
 |---|---|
-| `POST /codebase/projects/{project_id}/index` | Index or synchronize a local project. Body: `{"path":"<absolute path>"}`. |
+| `POST /codebase/projects/{project_id}/index` | Queue indexing and return `202` with a durable job ID. Body: `{"path":"<absolute path>"}`. |
+| `GET /codebase/index-jobs/{job_id}` | Read job status, progress, result, or sanitized error. |
 | `DELETE /codebase/projects/{project_id}` | Remove a project's index. |
 | `GET /codebase/projects` | List indexed project IDs and the `legacy` scope. |
 | `POST /codebase/search` | Search one scope. Body: `{"project_id":"my-project","query":"...","limit":10}`. |
@@ -67,6 +70,8 @@ Files over 1 MiB are skipped. A scan fails without publishing if it exceeds 128 
 For setup instructions for Codex, OMP, Pi, and Claude Code—including token handling, client-specific configuration, verification, and troubleshooting—see [MCP client setup](docs/mcp-clients.md).
 
 The MCP tools are `list_projects` and `search_codebase`. Search requires an explicit project ID or `legacy` and returns source snippets rather than generated answers. The MCP server does not index or delete projects. Project indexing and retrieval use the runtime `embedding.model`; changing that model is blocked while indexed vectors exist.
+
+The worker claims jobs with a PostgreSQL advisory lock held for the complete execution and a fenced execution ID on every status/progress write. A worker restart reconciles jobs whose publication pointer already contains the job ID; otherwise it records a sanitized `failed/interrupted` result. Slow live workers retain their advisory lock and are not incorrectly reclaimed. Model-lock contention requeues durably and uses bounded exponential backoff (`INDEX_MODEL_LOCK_BACKOFF_SECONDS`, capped at 30 seconds). Deploy `alembic upgrade head` before the API/worker, and during rollback stop accepting index jobs and the worker first; do not delete Chroma or generation metadata.
 
 ## Dataset management
 

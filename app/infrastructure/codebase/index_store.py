@@ -6,13 +6,14 @@ import errno
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
 import stat
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import chromadb
 import regex as safe_regex
@@ -23,6 +24,8 @@ from pathspec import PathSpec
 from app.application.rag.config_service import DEFAULT_CONFIGURATION
 from app.core.config import get_codebase_settings
 from app.infrastructure.rag.vector_store import CHROMA_DIRECTORY
+
+logger = logging.getLogger("uvicorn.error")
 
 PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 LEGACY_PROJECT_ID = "legacy"
@@ -495,9 +498,34 @@ class CodebaseIndexStore:
         except (OSError, ValueError, json.JSONDecodeError):
             return None
 
+    def validate_requested_path(self, requested: str) -> None:
+        """Validate the cheap part of the confined-scan contract at submit time."""
+        requested_path = Path(os.path.expanduser(requested))
+        if not requested_path.is_absolute():
+            raise RootNotAllowed("path is not allowed")
+        candidate = Path(os.path.abspath(requested_path))
+        if not candidate.exists() or not candidate.is_dir():
+            raise RootNotAllowed("path is not allowed")
+        resolved = candidate.resolve()
+        for root in self.configured_roots():
+            try:
+                resolved.relative_to(root.resolve())
+                if any(part.is_symlink() for part in [candidate, *candidate.parents]):
+                    raise RootNotAllowed("path is not allowed")
+                return
+            except ValueError:
+                continue
+        raise RootNotAllowed("path is not allowed")
+
     def index(self, project_id: str, requested_path: str, *, embedding_model: str | None = None,
-              model_lock_held: bool = False) -> dict[str, int | str | list[str]]:
-        self.validate_project_id(project_id)
+              model_lock_held: bool = False, job_id: str | None = None,
+              ownership_check: Callable[[], None] | None = None,
+              stage_callback: Callable[[str], None] | None = None,
+              progress_callback: Callable[[int, int, int], None] | None = None) -> dict[str, int | str | list[str]]:
+        operation = job_id or secrets.token_hex(8)
+        stage = "validation"
+        logger.info("codebase_index job_id=%s operation=%s stage=%s started",
+                    job_id or "-", operation, stage)
         lock = None
         model_lock = None
         collection_name = None
@@ -513,10 +541,34 @@ class CodebaseIndexStore:
             "gitignore_rules": 0,
         }
         try:
+            self.validate_project_id(project_id)
+            if ownership_check:
+                ownership_check()
+            if stage_callback:
+                stage_callback("validation")
+            logger.info("codebase_index job_id=%s operation=%s stage=%s completed",
+                        job_id or "-", operation, stage)
             if not model_lock_held:
+                stage = "locks"
+                logger.info("codebase_index job_id=%s operation=%s stage=%s started",
+                            job_id or "-", operation, stage)
                 model_lock = self.acquire_model_lock()
             lock = self._acquire(project_id)
+            logger.info("codebase_index job_id=%s operation=%s stage=%s completed",
+                        job_id or "-", operation, stage)
+            stage = "open_source"
+            logger.info("codebase_index job_id=%s operation=%s stage=%s started",
+                        job_id or "-", operation, stage)
+            if ownership_check:
+                ownership_check()
+            if stage_callback:
+                stage_callback("scan")
             fd, relative, inherited_rules = self._open_confined_directory(requested_path, scan_state)
+            logger.info("codebase_index job_id=%s operation=%s stage=%s completed",
+                        job_id or "-", operation, stage)
+            stage = "cleanup_previous"
+            logger.info("codebase_index job_id=%s operation=%s stage=%s started",
+                        job_id or "-", operation, stage)
             initial_publication_fd = self._open_flock(self._publication_lock_path(project_id))
             try:
                 fcntl.flock(initial_publication_fd, fcntl.LOCK_EX)
@@ -528,40 +580,85 @@ class CodebaseIndexStore:
                 )
             finally:
                 self._release_flock(initial_publication_fd)
+            logger.info("codebase_index job_id=%s operation=%s stage=%s completed",
+                        job_id or "-", operation, stage)
             scan_fd = fd
             fd = None
+            stage = "scan_and_chunk"
+            logger.info("codebase_index job_id=%s operation=%s stage=%s started",
+                        job_id or "-", operation, stage)
             chunks, skipped = self._chunks(scan_fd, relative, inherited_rules, scan_state)
+            logger.info("codebase_index job_id=%s operation=%s scan_complete files=%s chunks=%s skipped=%s",
+                        job_id or "-", operation, scan_state["files"], len(chunks), len(skipped))
+            if progress_callback:
+                progress_callback(0, len(chunks), len(skipped))
+            logger.info("codebase_index job_id=%s operation=%s stage=%s completed",
+                        job_id or "-", operation, stage)
             model = embedding_model or self._embedding_model()
             generation = secrets.token_hex(16)
             collection_name = self._collection_name(project_id, generation)
             client = self._client()
+            if ownership_check:
+                ownership_check()
+            if stage_callback:
+                stage_callback("create_collection")
+            stage = "create_collection"
+            logger.info("codebase_index job_id=%s operation=%s stage=%s started",
+                        job_id or "-", operation, stage)
             collection = client.create_collection(
                 name=collection_name,
                 metadata={"hnsw:space": "cosine", "project_id": project_id,
-                          "generation": generation, "embedding_model": model},
+                          "generation": generation, "embedding_model": model,
+                          "job_id": job_id or ""},
             )
+            logger.info("codebase_index job_id=%s operation=%s stage=%s completed",
+                        job_id or "-", operation, stage)
             if chunks:
                 embeddings = OllamaEmbeddings(model=model)
                 for start in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
+                    if ownership_check:
+                        ownership_check()
+                    if stage_callback:
+                        stage_callback("embedding")
+                    stage = "embedding"
                     batch = chunks[start:start + EMBEDDING_BATCH_SIZE]
+                    logger.info("codebase_index job_id=%s operation=%s stage=%s batch_start=%s batch_size=%s",
+                                job_id or "-", operation, stage, start, len(batch))
                     vectors = embeddings.embed_documents([item["content"] for item in batch])
+                    if stage_callback:
+                        stage_callback("store_batch")
+                    stage = "store_batch"
+                    logger.info("codebase_index job_id=%s operation=%s stage=%s batch_start=%s batch_size=%s",
+                                job_id or "-", operation, stage, start, len(batch))
                     collection.add(
                         ids=[f"{generation}:{index}" for index in range(start, start + len(batch))],
                         embeddings=vectors,
                         documents=[item["content"] for item in batch],
                         metadatas=[{key: value for key, value in item.items() if key != "content"} for item in batch],
                     )
+                    if progress_callback:
+                        progress_callback(start + len(batch), len(chunks), len(skipped))
             directory = self._project_dir(project_id)
             directory.mkdir(parents=True, exist_ok=True)
             metadata = {"project_id": project_id, "generation": generation,
-                        "collection_name": collection_name, "embedding_model": model}
+                        "collection_name": collection_name, "embedding_model": model,
+                        "job_id": job_id or "", "skipped_files": len(skipped)}
             generation_temp = self._building_generation_path(project_id, generation)
             generation_temp.write_text(json.dumps(metadata), encoding="utf-8")
             temporary = directory / f".current-{generation}.tmp"
             temporary.write_text(json.dumps(metadata), encoding="utf-8")
             publication_fd = self._open_flock(self._publication_lock_path(project_id))
             try:
+                if ownership_check:
+                    ownership_check()
+                if stage_callback:
+                    stage_callback("publish")
+                stage = "publish"
+                logger.info("codebase_index job_id=%s operation=%s stage=%s started",
+                            job_id or "-", operation, stage)
                 fcntl.flock(publication_fd, fcntl.LOCK_EX)
+                if ownership_check:
+                    ownership_check()
                 os.replace(temporary, self._metadata_path(project_id))
                 published = True
                 try:
@@ -576,15 +673,21 @@ class CodebaseIndexStore:
                     )
                 except Exception:
                     pass
+                logger.info("codebase_index job_id=%s operation=%s stage=%s completed",
+                            job_id or "-", operation, stage)
             finally:
                 try:
                     self._release_flock(publication_fd)
                 except OSError:
                     if not published:
                         raise
+            logger.info("codebase_index job_id=%s operation=%s completed chunks=%s skipped=%s",
+                        job_id or "-", operation, len(chunks), len(skipped))
             return {"project_id": project_id, "indexed_chunks": len(chunks),
                     "skipped_files": len(skipped), "skipped_paths": skipped}
-        except Exception:
+        except Exception as exc:
+            logger.error("codebase_index job_id=%s operation=%s stage=%s failed error_type=%s",
+                         job_id or "-", operation, stage, type(exc).__name__)
             if collection_name is not None and not published:
                 try:
                     self._client().delete_collection(collection_name)

@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any, Literal, Optional
 from uuid import UUID
 
-from sqlalchemy import CheckConstraint, Column, DateTime, Enum as SAEnum, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, Column, DateTime, Enum as SAEnum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlmodel import Field, SQLModel
 
@@ -41,6 +41,50 @@ class ExportStatus(str, Enum):
     ready = "ready"
     failed = "failed"
     expired = "expired"
+
+
+class IndexJobStatus(str, Enum):
+    queued = "queued"
+    running = "running"
+    succeeded = "succeeded"
+    failed = "failed"
+
+
+class IndexJobStage(str, Enum):
+    validation = "validation"
+    scan = "scan"
+    create_collection = "create_collection"
+    embedding = "embedding"
+    store_batch = "store_batch"
+    publish = "publish"
+
+
+class IndexJob(SQLModel, table=True):
+    __tablename__ = "index_jobs"
+    id: UUID = Field(default_factory=new_uuid7, primary_key=True)
+    project_id: str = Field(sa_column=Column(String(64), nullable=False))
+    source_path: str = Field(sa_column=Column(Text, nullable=False))
+    status: IndexJobStatus = Field(default=IndexJobStatus.queued, sa_column=Column(SAEnum(IndexJobStatus, name="index_job_status", native_enum=True), nullable=False))
+    stage: Optional[IndexJobStage] = Field(default=None, sa_column=Column(SAEnum(IndexJobStage, name="index_job_stage", native_enum=True)))
+    processed_chunks: int = Field(default=0, sa_column=Column(Integer, nullable=False))
+    total_chunks: Optional[int] = Field(default=None, sa_column=Column(Integer))
+    skipped_files: int = Field(default=0, sa_column=Column(Integer, nullable=False))
+    indexed_chunks: Optional[int] = Field(default=None, sa_column=Column(Integer))
+    error_code: Optional[str] = Field(default=None, sa_column=Column(String(64)))
+    error_message: Optional[str] = Field(default=None, sa_column=Column(String(256)))
+    execution_id: Optional[str] = Field(default=None, sa_column=Column(String(128)))
+    worker_id: Optional[str] = Field(default=None, sa_column=Column(String(256)))
+    heartbeat_at: Optional[datetime] = Field(default=None, sa_column=Column(DateTime(timezone=True)))
+    created_at: datetime = Field(default_factory=now, sa_column=Column(DateTime(timezone=True), nullable=False))
+    started_at: Optional[datetime] = Field(default=None, sa_column=Column(DateTime(timezone=True)))
+    finished_at: Optional[datetime] = Field(default=None, sa_column=Column(DateTime(timezone=True)))
+
+    __table_args__ = (
+        Index("ix_index_jobs_project_created", "project_id", "created_at"),
+        Index("ix_index_jobs_queue", "status", "created_at"),
+        Index("uq_index_jobs_active_project", "project_id", unique=True,
+              postgresql_where=sa_text("status IN ('queued', 'running')")),
+    )
 
 
 class TrainingDataset(SQLModel, table=True):

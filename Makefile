@@ -8,7 +8,7 @@ COMPOSE_FILES += -f compose.codebase-roots.yaml
 endif
 COMPOSE := $(DOCKER_COMPOSE) --env-file $(ENV_FILE) $(COMPOSE_FILES)
 
-.PHONY: help multi-root config up ps logs health down
+.PHONY: help multi-root config up ps logs health down worker
 
 help:
 	@printf '%s\n' \
@@ -17,6 +17,7 @@ help:
 	  'make up          Build and start/recreate the Aurora API' \
 	  'make ps          Show Compose service status' \
 	  'make logs        Follow Aurora API logs' \
+	  'make worker      Follow durable codebase worker logs' \
 	  'make health      Check the Aurora OpenAPI endpoint' \
 	  'make down        Stop Compose services; preserve named volumes'
 
@@ -32,13 +33,18 @@ config:
 	$(COMPOSE) config -q
 
 up:
-	$(COMPOSE) up -d --build --force-recreate api
+	$(COMPOSE) build api worker
+	$(COMPOSE) run --rm --no-deps api alembic upgrade head
+	$(COMPOSE) up -d --force-recreate api worker
 
 ps:
 	$(COMPOSE) ps
 
 logs:
 	$(COMPOSE) logs -f api
+
+worker:
+	$(COMPOSE) logs -f worker
 
 health:
 	curl --fail --silent --show-error $(AURORA_URL)/openapi.json -o /dev/null
